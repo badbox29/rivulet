@@ -49,9 +49,11 @@ const LEAK_DAYS = 90;
 const App = {
   data: null,
   syncCheckTimer: null,
-  filter: 'all',     // status filter
+  filter: 'all',        // status filter
   search: '',
-  editingId: null,   // id of subscription being edited, or null when adding
+  editingId: null,      // id of subscription being edited, or null when adding
+  heroView: 'stream',   // 'stream' | 'category' — what the hero bars show
+  categoryFilter: null, // selected category name, or null
 };
 
 // ─── Data model ───────────────────────────────────────────────────
@@ -136,6 +138,27 @@ function isActive(sub){ return sub.status === 'active'; }
 
 function activeMonthlyTotal() {
   return App.data.subscriptions.filter(isActive).reduce((sum, s) => sum + monthly(s), 0);
+}
+
+// Monthly spend on active streams in one category.
+function categoryMonthly(cat) {
+  return App.data.subscriptions
+    .filter(s => isActive(s) && s.category === cat)
+    .reduce((sum, s) => sum + monthly(s), 0);
+}
+
+// Categories that have at least one active stream, with their monthly spend
+// and active count, ranked by spend. "Used categories only" — the breakdown
+// never shows an empty tributary.
+function usedCategories() {
+  const agg = {};
+  for (const s of App.data.subscriptions) {
+    if (!isActive(s)) continue;
+    (agg[s.category] = agg[s.category] || { category: s.category, total: 0, count: 0 });
+    agg[s.category].total += monthly(s);
+    agg[s.category].count += 1;
+  }
+  return Object.values(agg).sort((a, b) => b.total - a.total);
 }
 
 function formatMoney(n, currency = App.data.settings.currency) {
@@ -490,22 +513,41 @@ function renderRemindersList() {
 
 function renderHero() {
   const period = App.data.settings.flowView;
+  const annual = period === 'annual';
   $$('.flow-toggle-btn').forEach(b => b.classList.toggle('is-active', b.dataset.period === period));
+  $$('.view-toggle-btn').forEach(b => b.classList.toggle('is-active', b.dataset.view === App.heroView));
+  $('#hero').classList.toggle('view-category', App.heroView === 'category');
 
-  const monthlyTotal = activeMonthlyTotal();
-  const shown = period === 'annual' ? monthlyTotal * 12 : monthlyTotal;
+  const cat = App.heroView === 'category' ? App.categoryFilter : null;
+  const baseMonthly = cat ? categoryMonthly(cat) : activeMonthlyTotal();
+  const shown = annual ? baseMonthly * 12 : baseMonthly;
   animateNumber($('#flow-amount'), shown, formatMoney);
 
+  // Eyebrow names the current scope so the big number is never ambiguous.
+  $('#hero-eyebrow').textContent = cat
+    ? `${cat} · ${annual ? 'annual' : 'monthly'} flow`
+    : `${annual ? 'Annual' : 'Monthly'} flow`;
+
+  $('#flow-substats').innerHTML = cat ? categorySubstats(cat, annual) : globalSubstats(annual);
+
+  // Clear button only when a category is selected.
+  const clearBtn = $('#cat-clear');
+  if (clearBtn) clearBtn.style.display = cat ? '' : 'none';
+
+  if (App.heroView === 'category') renderCategoryBars(annual);
+  else renderStreamBars();
+}
+
+function globalSubstats(annual) {
   const subs = App.data.subscriptions;
+  const monthlyTotal = activeMonthlyTotal();
   const activeCount = subs.filter(isActive).length;
-  const renewWeek = subs.filter(s => isActive(s)).filter(s => { const d = daysUntil(s.nextChargeDate); return d != null && d >= 0 && d <= 7; }).length;
+  const renewWeek = subs.filter(isActive).filter(s => { const d = daysUntil(s.nextChargeDate); return d != null && d >= 0 && d <= 7; }).length;
   const trials = subs.filter(s => s.status === 'trial').length;
   const leaks = subs.filter(isLeak).length;
   const reclaim = leakMonthly();
   const increases = subs.filter(s => recentIncrease(s, 90)).length;
-  const other = period === 'annual'
-    ? `${formatMoney(monthlyTotal)}/mo`
-    : `${formatMoney(monthlyTotal * 12)}/year`;
+  const other = annual ? `${formatMoney(monthlyTotal)}/mo` : `${formatMoney(monthlyTotal * 12)}/year`;
 
   const bits = [
     `<b>${other.split('/')[0]}</b>/${other.split('/')[1]}`,
@@ -515,25 +557,75 @@ function renderHero() {
   if (trials)    bits.push(`<b>${trials}</b> ${trials === 1 ? 'trial' : 'trials'}`);
   if (increases) bits.push(`<span class="leak-stat">${increases} price ${increases === 1 ? 'rise' : 'rises'}</span>`);
   if (leaks)     bits.push(`<span class="leak-stat">${leaks} ${leaks === 1 ? 'leak' : 'leaks'}${reclaim > 0 ? ` · reclaim ${formatMoney(reclaim)}/mo` : ''}</span>`);
-  $('#flow-substats').innerHTML = bits.join(' · ');
+  return bits.join(' · ');
+}
 
-  // Stream bars — active subs, widest = costliest, draining rightward.
-  // Each bar renders at its target width; the riv-fill keyframe sweeps it in
-  // from 0 on creation, so this replays on every hero render (load,
-  // monthly/annual, by-category). Disabled under prefers-reduced-motion in CSS.
-  const ranked = subs.filter(isActive).map(s => ({ s, m: monthly(s) })).sort((a, b) => b.m - a.m).slice(0, 8);
+function categorySubstats(cat, annual) {
+  const inCat = App.data.subscriptions.filter(s => isActive(s) && s.category === cat);
+  const total = activeMonthlyTotal();
+  const catMonthly = categoryMonthly(cat);
+  const share = total > 0 ? Math.round((catMonthly / total) * 100) : 0;
+  const leaks = App.data.subscriptions.filter(s => isLeak(s) && s.category === cat).length;
+  const bits = [
+    `<b>${inCat.length}</b> ${inCat.length === 1 ? 'stream' : 'streams'} in ${esc(cat)}`,
+    `<b>${share}%</b> of your flow`,
+  ];
+  if (leaks) bits.push(`<span class="leak-stat">${leaks} ${leaks === 1 ? 'leak' : 'leaks'}</span>`);
+  return bits.join(' · ');
+}
+
+// Per-stream bars — widest = costliest, draining rightward. Each bar renders
+// at its target width; the riv-fill keyframe sweeps it in from 0 on creation,
+// so this replays on every hero render. Disabled under reduced-motion in CSS.
+function renderStreamBars() {
+  const ranked = App.data.subscriptions.filter(isActive)
+    .map(s => ({ s, m: monthly(s) })).sort((a, b) => b.m - a.m).slice(0, 8);
   const max = ranked.length ? ranked[0].m : 1;
-  $('#flow-streams').innerHTML = ranked.map(({ s, m }) => {
-    const target = Math.max(6, (m / max) * 100);
-    return `
+  $('#flow-streams').innerHTML = ranked.map(({ s, m }) => `
     <div class="stream-bar-row">
       <span class="stream-bar-name">${esc(s.name || 'Untitled')}</span>
       <div class="stream-bar-track">
-        <div class="stream-bar-fill" style="width:${target.toFixed(2)}%;"></div>
+        <div class="stream-bar-fill" style="width:${Math.max(6, (m / max) * 100).toFixed(2)}%;"></div>
       </div>
       <span class="stream-bar-amt">${formatMoney(m)}</span>
+    </div>`).join('');
+}
+
+// Per-category bars — each a tributary; click to scope the hero + filter the
+// list. Used categories only, top 10 by spend.
+function renderCategoryBars(annual) {
+  const cats = usedCategories().slice(0, 10);
+  const container = $('#flow-streams');
+  if (!cats.length) {
+    container.innerHTML = `<p class="muted f13" style="padding:.4rem 0;">No active streams to break down yet.</p>`;
+    return;
+  }
+  const max = cats[0].total || 1;
+  container.innerHTML = cats.map(({ category, total }) => {
+    const amt = formatMoney(annual ? total * 12 : total);
+    const sel = App.categoryFilter === category;
+    return `
+    <div class="stream-bar-row cat-bar-row ${sel ? 'is-selected' : ''}" data-cat="${esc(category)}" role="button" tabindex="0" aria-pressed="${sel}">
+      <span class="stream-bar-name">${esc(category)}</span>
+      <div class="stream-bar-track">
+        <div class="stream-bar-fill" style="width:${Math.max(6, (total / max) * 100).toFixed(2)}%;"></div>
+      </div>
+      <span class="stream-bar-amt">${amt}</span>
     </div>`;
   }).join('');
+
+  $$('#flow-streams .cat-bar-row').forEach(row => {
+    const pick = () => selectCategory(row.dataset.cat);
+    row.addEventListener('click', pick);
+    row.addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); pick(); } });
+  });
+}
+
+// Toggle a category scope on/off, then re-render hero + list.
+function selectCategory(cat) {
+  App.categoryFilter = (App.categoryFilter === cat) ? null : cat;
+  renderHero();
+  renderStreams();
 }
 
 function renderUpcoming() {
@@ -571,8 +663,19 @@ function renderStreams(animate = true) {
   const q = App.search.trim().toLowerCase();
   let rows = App.data.subscriptions.slice();
 
+  if (App.categoryFilter) rows = rows.filter(s => s.category === App.categoryFilter);
   if (App.filter !== 'all') rows = rows.filter(s => s.status === App.filter);
   if (q) rows = rows.filter(s => (s.name + ' ' + s.category).toLowerCase().includes(q));
+
+  // Scope indicator — shows the active category and clears it on click.
+  const scope = $('#stream-scope');
+  if (scope) {
+    scope.innerHTML = App.categoryFilter
+      ? `<button class="scope-chip" title="Clear category filter">${esc(App.categoryFilter)} ✕</button>`
+      : '';
+    const chip = scope.querySelector('.scope-chip');
+    if (chip) chip.addEventListener('click', () => selectCategory(App.categoryFilter));
+  }
 
   // active first, then by next charge proximity, then name
   rows.sort((a, b) => {
@@ -805,6 +908,14 @@ function wireEvents() {
     App.data.settings.flowView = b.dataset.period;
     saveLocal(); renderHero();
   }));
+
+  // hero bars view toggle (Streams / Categories)
+  $$('.view-toggle-btn').forEach(b => b.addEventListener('click', () => {
+    App.heroView = b.dataset.view;
+    if (App.heroView === 'stream') App.categoryFilter = null;   // category scope is a category-view concept
+    renderHero(); renderStreams();
+  }));
+  $('#cat-clear').addEventListener('click', () => { if (App.categoryFilter) selectCategory(App.categoryFilter); });
 
   // settings: preferences
   $('#settings-currency').addEventListener('change', e => { App.data.settings.currency = e.target.value; markDirty(); renderApp(); });
