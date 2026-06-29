@@ -96,7 +96,7 @@ function newSubscription() {
     id: uid(), name: '', amount: 0, currency: App.data?.settings?.currency || 'USD',
     frequency: 'monthly', category: 'Other', nextChargeDate: '', autoRenews: true,
     paymentLabel: '', status: 'active', lastUsedDate: '', notes: '',
-    taxIncluded: true, noticeDays: 0,
+    taxIncluded: true, noticeDays: 0, emailAlert: false,
     priceHistory: [], createdAt: now, updatedAt: now,
   };
 }
@@ -451,6 +451,197 @@ function markEntering(container) {
   }
 }
 
+// ─── CSV import ───────────────────────────────────────────────────
+// Column order for the downloadable template. Mirrors the data model and
+// includes emailAlert (default no) ahead of the email feature.
+const CSV_COLUMNS = ['name', 'amount', 'currency', 'frequency', 'category',
+  'nextChargeDate', 'status', 'paymentLabel', 'lastUsedDate', 'noticeDays',
+  'taxIncluded', 'autoRenews', 'emailAlert', 'notes'];
+
+function csvCell(v) {
+  v = String(v == null ? '' : v);
+  return /[",\r\n]/.test(v) ? '"' + v.replace(/"/g, '""') + '"' : v;
+}
+
+function csvTemplate() {
+  const examples = [
+    ['Netflix', '15.49', 'USD', 'monthly', 'Entertainment', '2026-07-15', 'active', 'Visa ••4421', '2026-06-22', '0', 'yes', 'yes', 'no', 'Standard plan'],
+    ['Adobe Creative Cloud', '59.99', 'USD', 'monthly', 'Development', '2026-07-02', 'active', 'Amex', '', '30', 'yes', 'yes', 'yes', '30-day cancellation notice required'],
+  ];
+  return [CSV_COLUMNS, ...examples].map(r => r.map(csvCell).join(',')).join('\r\n') + '\r\n';
+}
+
+// Minimal RFC-4180-ish parser: quoted fields, escaped "" quotes, commas and
+// newlines inside quotes, CRLF or LF, leading BOM tolerated.
+function parseCSV(text) {
+  const rows = []; let row = [], field = '', inQ = false;
+  text = text.replace(/^\uFEFF/, '');
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (inQ) {
+      if (c === '"') { if (text[i + 1] === '"') { field += '"'; i++; } else inQ = false; }
+      else field += c;
+    } else if (c === '"') { inQ = true; }
+    else if (c === ',') { row.push(field); field = ''; }
+    else if (c === '\r') { /* ignore */ }
+    else if (c === '\n') { row.push(field); rows.push(row); row = []; field = ''; }
+    else field += c;
+  }
+  if (field.length || row.length) { row.push(field); rows.push(row); }
+  return rows;
+}
+
+function validDateStr(s) { return /^\d{4}-\d{2}-\d{2}$/.test(s) && parseDate(s) ? s : ''; }
+
+function importCSV(text) {
+  const rows = parseCSV(text).filter(r => r.some(c => c.trim() !== ''));
+  if (!rows.length) return { added: 0, skipped: 0, errors: ['The file looks empty.'] };
+
+  const idx = {};
+  rows[0].forEach((h, i) => { idx[h.trim().toLowerCase()] = i; });
+  if (idx['name'] == null || idx['amount'] == null) {
+    return { added: 0, skipped: 0, errors: ['Missing a "name" or "amount" column. Please use the template.'] };
+  }
+
+  const get = (cols, key) => { const i = idx[key.toLowerCase()]; return i == null ? '' : String(cols[i] ?? '').trim(); };
+  const has = key => idx[key.toLowerCase()] != null;
+  const yes = v => /^(y|yes|true|1)$/i.test(v);
+  const validFreq = FREQUENCIES.map(f => f.id);
+  const validStatus = STATUSES.map(s => s.id);
+  const catLookup = {}; CATEGORIES.forEach(c => catLookup[c.toLowerCase()] = c);
+
+  let added = 0, skipped = 0; const errors = [];
+  for (let r = 1; r < rows.length; r++) {
+    const cols = rows[r];
+    const name = get(cols, 'name');
+    const amount = parseFloat(get(cols, 'amount'));
+    if (!name) { skipped++; errors.push(`Row ${r + 1}: no name — skipped.`); continue; }
+    if (isNaN(amount) || amount < 0) { skipped++; errors.push(`Row ${r + 1} (${name}): amount isn't a valid number — skipped.`); continue; }
+
+    const sub = newSubscription();
+    sub.name = name;
+    sub.amount = amount;
+    const cur = get(cols, 'currency').toUpperCase();
+    sub.currency = CURRENCIES.includes(cur) ? cur : (App.data.settings.currency || 'USD');
+    const fr = get(cols, 'frequency').toLowerCase();
+    sub.frequency = validFreq.includes(fr) ? fr : 'monthly';
+    sub.category = catLookup[get(cols, 'category').toLowerCase()] || 'Other';
+    sub.nextChargeDate = validDateStr(get(cols, 'nextChargeDate'));
+    const st = get(cols, 'status').toLowerCase();
+    sub.status = validStatus.includes(st) ? st : 'active';
+    sub.paymentLabel = get(cols, 'paymentLabel');
+    sub.lastUsedDate = validDateStr(get(cols, 'lastUsedDate'));
+    sub.noticeDays = Math.max(0, parseInt(get(cols, 'noticeDays'), 10) || 0);
+    const tax = get(cols, 'taxIncluded');
+    sub.taxIncluded = has('taxIncluded') && tax !== '' ? yes(tax) : true;
+    const ar = get(cols, 'autoRenews');
+    sub.autoRenews = has('autoRenews') && ar !== '' ? yes(ar) : true;
+    sub.emailAlert = yes(get(cols, 'emailAlert'));   // defaults no when blank/missing
+    sub.notes = get(cols, 'notes');
+    sub.priceHistory = [{ date: new Date().toISOString().slice(0, 10), amount, note: 'Imported' }];
+    App.data.subscriptions.push(sub);
+    added++;
+  }
+  return { added, skipped, errors };
+}
+
+function downloadTemplate() {
+  const blob = new Blob([csvTemplate()], { type: 'text/csv;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = 'rivulet-import-template.csv';
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 0);
+}
+
+function openImport() { $('#import-result').innerHTML = ''; $('#import-file').value = ''; openModal('modal-import'); }
+
+async function handleImportFile(file) {
+  if (!file) return;
+  let text;
+  try { text = await file.text(); }
+  catch { $('#import-result').innerHTML = `<p class="import-warn">Couldn't read that file.</p>`; return; }
+
+  const res = importCSV(text);
+  if (res.added) { markDirty(); renderApp(); if (!Auth.isGuest()) pushToWorker(); }
+
+  const out = $('#import-result');
+  let html = '';
+  if (res.added) html += `<p class="import-ok">Imported ${res.added} ${res.added === 1 ? 'stream' : 'streams'} 🌊</p>`;
+  if (res.skipped) html += `<p class="import-warn">Skipped ${res.skipped} ${res.skipped === 1 ? 'row' : 'rows'}.</p>`;
+  if (res.errors.length) {
+    const shown = res.errors.slice(0, 8).map(e => `<li>${esc(e)}</li>`).join('');
+    const more = res.errors.length > 8 ? `<li>…and ${res.errors.length - 8} more</li>` : '';
+    html += `<ul class="import-errors">${shown}${more}</ul>`;
+  }
+  if (!html) html = `<p class="import-warn">No rows found to import.</p>`;
+  out.innerHTML = html;
+  $('#import-file').value = '';   // allow re-importing the same filename
+
+  if (res.added && !res.skipped && !res.errors.length) {
+    toast(`Imported ${res.added} ${res.added === 1 ? 'stream' : 'streams'} 🌊`);
+    setTimeout(() => closeModal('modal-import'), 1300);
+  }
+}
+
+// ─── Quick-add templates ──────────────────────────────────────────
+// Popular services with approximate US monthly prices — a starting point the
+// user adjusts. Alphabetical for findability in the dropdown.
+const QUICK_TEMPLATES = [
+  { name: '1Password', category: 'Security', amount: 2.99, frequency: 'monthly' },
+  { name: 'Adobe Creative Cloud', category: 'Development', amount: 59.99, frequency: 'monthly' },
+  { name: 'Adobe Photography Plan', category: 'Development', amount: 9.99, frequency: 'monthly' },
+  { name: 'Amazon Prime', category: 'Shopping', amount: 14.99, frequency: 'monthly' },
+  { name: 'Apple Fitness+', category: 'Fitness', amount: 9.99, frequency: 'monthly' },
+  { name: 'Apple Music', category: 'Music', amount: 10.99, frequency: 'monthly' },
+  { name: 'Apple TV+', category: 'Entertainment', amount: 9.99, frequency: 'monthly' },
+  { name: 'Audible', category: 'Entertainment', amount: 14.95, frequency: 'monthly' },
+  { name: 'Calm', category: 'Health', amount: 14.99, frequency: 'monthly' },
+  { name: 'Canva Pro', category: 'Productivity', amount: 14.99, frequency: 'monthly' },
+  { name: 'ChatGPT Plus', category: 'Productivity', amount: 20, frequency: 'monthly' },
+  { name: 'Claude Pro', category: 'Productivity', amount: 20, frequency: 'monthly' },
+  { name: 'Crunchyroll', category: 'Entertainment', amount: 7.99, frequency: 'monthly' },
+  { name: 'Disney+', category: 'Entertainment', amount: 15.99, frequency: 'monthly' },
+  { name: 'Dropbox Plus', category: 'Cloud', amount: 11.99, frequency: 'monthly' },
+  { name: 'ESPN+', category: 'Entertainment', amount: 11.99, frequency: 'monthly' },
+  { name: 'ExpressVPN', category: 'Security', amount: 12.95, frequency: 'monthly' },
+  { name: 'GitHub Pro', category: 'Development', amount: 4, frequency: 'monthly' },
+  { name: 'Google One', category: 'Cloud', amount: 1.99, frequency: 'monthly' },
+  { name: 'Grammarly Premium', category: 'Productivity', amount: 12, frequency: 'monthly' },
+  { name: 'HBO Max', category: 'Entertainment', amount: 16.99, frequency: 'monthly' },
+  { name: 'Headspace', category: 'Health', amount: 12.99, frequency: 'monthly' },
+  { name: 'Hulu', category: 'Entertainment', amount: 18.99, frequency: 'monthly' },
+  { name: 'iCloud+', category: 'Cloud', amount: 2.99, frequency: 'monthly' },
+  { name: 'Microsoft 365', category: 'Productivity', amount: 9.99, frequency: 'monthly' },
+  { name: 'Netflix', category: 'Entertainment', amount: 17.99, frequency: 'monthly' },
+  { name: 'Nintendo Switch Online', category: 'Gaming', amount: 3.99, frequency: 'monthly' },
+  { name: 'NordVPN', category: 'Security', amount: 12.99, frequency: 'monthly' },
+  { name: 'Notion Plus', category: 'Productivity', amount: 10, frequency: 'monthly' },
+  { name: 'NYTimes', category: 'News', amount: 17, frequency: 'monthly' },
+  { name: 'Paramount+', category: 'Entertainment', amount: 12.99, frequency: 'monthly' },
+  { name: 'Peacock Premium', category: 'Entertainment', amount: 7.99, frequency: 'monthly' },
+  { name: 'PlayStation Plus', category: 'Gaming', amount: 10.99, frequency: 'monthly' },
+  { name: 'Spotify Premium', category: 'Music', amount: 11.99, frequency: 'monthly' },
+  { name: 'Strava', category: 'Fitness', amount: 11.99, frequency: 'monthly' },
+  { name: 'The Athletic', category: 'News', amount: 7.99, frequency: 'monthly' },
+  { name: 'Tidal', category: 'Music', amount: 10.99, frequency: 'monthly' },
+  { name: 'Walmart+', category: 'Shopping', amount: 12.95, frequency: 'monthly' },
+  { name: 'WSJ', category: 'News', amount: 38.99, frequency: 'monthly' },
+  { name: 'Xbox Game Pass Ultimate', category: 'Gaming', amount: 19.99, frequency: 'monthly' },
+  { name: 'YouTube Premium', category: 'Entertainment', amount: 13.99, frequency: 'monthly' },
+  { name: 'YouTube TV', category: 'Entertainment', amount: 82.99, frequency: 'monthly' },
+  { name: 'Zoom Pro', category: 'Communication', amount: 14.99, frequency: 'monthly' },
+];
+
+function applyTemplate(i) {
+  const t = QUICK_TEMPLATES[i];
+  if (!t) return;
+  $('#sub-name').value = t.name;
+  $('#sub-amount').value = t.amount;
+  $('#sub-frequency').value = t.frequency;
+  $('#sub-category').value = t.category;
+}
+
 // ─── Rendering ────────────────────────────────────────────────────
 function renderApp() {
   const subs = App.data.subscriptions;
@@ -746,6 +937,13 @@ function openSubModal(id = null) {
   fillSelect($('#sub-category'), CATEGORIES, c => c, c => c);
   fillSelect($('#sub-status'), STATUSES, s => s.id, s => s.label);
 
+  // Quick-fill is only useful when adding; populate fresh and hide on edit.
+  const tpl = $('#sub-template');
+  tpl.innerHTML = `<option value="">— none —</option>` +
+    QUICK_TEMPLATES.map((t, i) => `<option value="${i}">${esc(t.name)}</option>`).join('');
+  tpl.value = '';
+  $('#sub-template-group').style.display = id ? 'none' : '';
+
   $('#sub-modal-title').textContent = id ? 'Edit stream' : 'Add stream';
   $('#sub-name').value     = sub.name;
   $('#sub-amount').value    = sub.amount || '';
@@ -881,8 +1079,13 @@ async function importBackup(file) {
 function wireEvents() {
   $('#btn-settings').addEventListener('click', openSettings);
   $('#btn-reminders').addEventListener('click', openReminders);
+  $('#btn-import').addEventListener('click', openImport);
   $('#btn-add').addEventListener('click', () => openSubModal());
   $('#btn-add-empty').addEventListener('click', () => openSubModal());
+
+  $('#import-download').addEventListener('click', downloadTemplate);
+  $('#import-file').addEventListener('change', e => handleImportFile(e.target.files && e.target.files[0]));
+  $('#sub-template').addEventListener('change', e => { if (e.target.value !== '') applyTemplate(+e.target.value); });
 
   $('#sub-save').addEventListener('click', saveSubscription);
   $('#sub-delete').addEventListener('click', deleteSubscription);
