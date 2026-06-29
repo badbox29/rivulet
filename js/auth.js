@@ -975,9 +975,15 @@ const Auth = (() => {
       </div>
       <div class="form-group">
         <label class="form-label">Worker URL</label>
-        <input class="input" id="auth-fresh-worker"
-               placeholder="https://your-worker.workers.dev"/>
+        <div class="row gap-8">
+          <input class="input" id="auth-fresh-worker"
+                 placeholder="https://your-worker.workers.dev" style="flex:1;"/>
+          <button class="btn btn-outline btn-sm" id="auth-btn-fresh-test"
+                  style="white-space:nowrap;">Test</button>
+        </div>
         <div class="form-hint">Required for cross-device sync.</div>
+        <div id="auth-fresh-worker-status" class="row gap-8"
+             style="min-height:1.3rem;font-size:.82rem;margin-top:.35rem;"></div>
       </div>
       <div id="auth-fresh-status"
            style="min-height:1.3rem;font-size:.82rem;color:var(--red,#c07070);margin-bottom:.5rem;">
@@ -1002,6 +1008,30 @@ const Auth = (() => {
     const userInput   = document.getElementById('auth-fresh-username');
     const workerInput = document.getElementById('auth-fresh-worker');
     const statusEl    = document.getElementById('auth-fresh-status');
+
+    // ── Worker connection test (green/red dot) ─────────────────
+    const workerStatusEl = document.getElementById('auth-fresh-worker-status');
+    function renderWorkerStatus(state, msg) {
+      const color = state === 'ok'  ? 'var(--green,#3e8e6f)'
+                  : state === 'err' ? 'var(--red,#c0524a)'
+                  :                    'var(--gold2,#b8985a)';
+      const ring  = state === 'ok'  ? 'rgba(62,142,111,.18)'
+                  : state === 'err' ? 'rgba(192,82,74,.18)'
+                  :                    'rgba(184,152,90,.18)';
+      const dot = `<span style="display:inline-block;width:9px;height:9px;border-radius:50%;`
+                + `background:${color};box-shadow:0 0 0 3px ${ring};flex:none;"></span>`;
+      workerStatusEl.innerHTML = `${dot}<span style="color:${color};">${msg}</span>`;
+    }
+    async function testFreshWorker() {
+      const url = workerInput.value.trim();
+      if (!url) { renderWorkerStatus('err', 'Enter a Worker URL first.'); return; }
+      renderWorkerStatus('testing', 'Testing connection…');
+      const ok = await testWorkerUrl(url);
+      renderWorkerStatus(ok ? 'ok' : 'err',
+        ok ? 'Connected \u2713' : 'Could not reach that URL — check it and try again.');
+    }
+    document.getElementById('auth-btn-fresh-test').addEventListener('click', testFreshWorker);
+    workerInput.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); testFreshWorker(); } });
 
     function validate() {
       if(!workerInput.value.trim()) { statusEl.textContent = 'Please enter your Worker URL.'; return false; }
