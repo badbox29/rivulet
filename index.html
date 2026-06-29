@@ -41,7 +41,7 @@
   <!-- Hero: the flow -->
   <section id="hero" class="hero" hidden>
     <div class="hero-head">
-      <p class="eyebrow">Monthly flow</p>
+      <p class="eyebrow" id="hero-eyebrow">Monthly flow</p>
       <div class="flow-toggle" role="group" aria-label="Flow period">
         <button class="flow-toggle-btn is-active" data-period="monthly">Monthly</button>
         <button class="flow-toggle-btn" data-period="annual">Annual</button>
@@ -54,7 +54,15 @@
     </div>
     <p id="flow-substats" class="flow-substats"></p>
 
-    <div id="flow-streams" class="flow-streams" aria-hidden="true"></div>
+    <div class="bars-head">
+      <div class="view-toggle" role="group" aria-label="Breakdown by">
+        <button class="view-toggle-btn is-active" data-view="stream">Streams</button>
+        <button class="view-toggle-btn" data-view="category">Categories</button>
+      </div>
+      <button id="cat-clear" class="btn btn-ghost btn-sm" style="display:none;">✕ Clear</button>
+    </div>
+
+    <div id="flow-streams" class="flow-streams"></div>
   </section>
 
   <!-- Upcoming charges -->
@@ -69,7 +77,7 @@
   <!-- All streams -->
   <section id="streams-section" class="panel" hidden>
     <div class="panel-head">
-      <h2 class="panel-title">Your streams</h2>
+      <h2 class="panel-title">Your streams <span id="stream-scope" class="stream-scope"></span></h2>
       <button id="btn-add" class="btn btn-primary btn-sm">+ Add stream</button>
     </div>
     <div id="status-filters" class="chips">
