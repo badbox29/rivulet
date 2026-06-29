@@ -396,6 +396,38 @@ async function fetchGoogleClientId() {
   } catch { return ''; }
 }
 
+// ─── Motion helpers ───────────────────────────────────────────────
+function prefersReducedMotion() {
+  return !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+}
+
+// Tween a number into el (e.g. the flow total) from its last shown value.
+// First paint counts up from 0; later changes ease from the previous value.
+function animateNumber(el, to, fmt, dur = 600) {
+  const from = (typeof el._rivVal === 'number') ? el._rivVal : 0;
+  el._rivVal = to;
+  if (prefersReducedMotion() || from === to || typeof requestAnimationFrame === 'undefined') {
+    el.textContent = fmt(to); return;
+  }
+  const start = (typeof performance !== 'undefined' ? performance.now() : Date.now());
+  (function tick(now) {
+    const t = Math.min(1, ((now || Date.now()) - start) / dur);
+    const eased = 1 - Math.pow(1 - t, 3);           // easeOutCubic
+    el.textContent = fmt(from + (to - from) * eased);
+    if (t < 1) requestAnimationFrame(tick); else el.textContent = fmt(to);
+  })(start);
+}
+
+// Tag freshly-rendered rows so CSS rises them into place, with a capped stagger.
+function markEntering(container) {
+  if (prefersReducedMotion()) return;
+  const rows = container.children;
+  for (let i = 0; i < rows.length; i++) {
+    rows[i].classList.add('riv-enter');
+    rows[i].style.animationDelay = `${Math.min(i, 12) * 28}ms`;
+  }
+}
+
 // ─── Rendering ────────────────────────────────────────────────────
 function renderApp() {
   const subs = App.data.subscriptions;
@@ -452,6 +484,8 @@ function renderRemindersList() {
   });
   $$('#reminders-list .reminder-dismiss').forEach(b =>
     b.addEventListener('click', e => { e.stopPropagation(); dismissReminder(b.dataset.id); }));
+
+  markEntering(list);
 }
 
 function renderHero() {
@@ -460,7 +494,7 @@ function renderHero() {
 
   const monthlyTotal = activeMonthlyTotal();
   const shown = period === 'annual' ? monthlyTotal * 12 : monthlyTotal;
-  $('#flow-amount').textContent = formatMoney(shown);
+  animateNumber($('#flow-amount'), shown, formatMoney);
 
   const subs = App.data.subscriptions;
   const activeCount = subs.filter(isActive).length;
@@ -483,17 +517,25 @@ function renderHero() {
   if (leaks)     bits.push(`<span class="leak-stat">${leaks} ${leaks === 1 ? 'leak' : 'leaks'}${reclaim > 0 ? ` · reclaim ${formatMoney(reclaim)}/mo` : ''}</span>`);
   $('#flow-substats').innerHTML = bits.join(' · ');
 
-  // Stream bars — active subs, widest = costliest, draining rightward
+  // Stream bars — active subs, widest = costliest, draining rightward.
+  // Render at 0 width, then flow out to target so the dashboard fills like water.
   const ranked = subs.filter(isActive).map(s => ({ s, m: monthly(s) })).sort((a, b) => b.m - a.m).slice(0, 8);
   const max = ranked.length ? ranked[0].m : 1;
-  $('#flow-streams').innerHTML = ranked.map(({ s, m }) => `
+  const reduce = prefersReducedMotion();
+  $('#flow-streams').innerHTML = ranked.map(({ s, m }) => {
+    const target = Math.max(6, (m / max) * 100);
+    return `
     <div class="stream-bar-row">
       <span class="stream-bar-name">${esc(s.name || 'Untitled')}</span>
       <div class="stream-bar-track">
-        <div class="stream-bar-fill" style="width:${Math.max(6, (m / max) * 100)}%;"></div>
+        <div class="stream-bar-fill" data-w="${target.toFixed(2)}" style="width:${reduce ? target.toFixed(2) + '%' : '0%'};"></div>
       </div>
       <span class="stream-bar-amt">${formatMoney(m)}</span>
-    </div>`).join('');
+    </div>`;
+  }).join('');
+  if (!reduce) {
+    requestAnimationFrame(() => $$('#flow-streams .stream-bar-fill').forEach(el => { el.style.width = el.dataset.w + '%'; }));
+  }
 }
 
 function renderUpcoming() {
@@ -523,9 +565,11 @@ function renderUpcoming() {
         <span class="upcoming-amt">${formatMoney(s.amount, s.currency)}</span>
       </li>`;
   }).join('');
+
+  markEntering($('#upcoming-list'));
 }
 
-function renderStreams() {
+function renderStreams(animate = true) {
   const q = App.search.trim().toLowerCase();
   let rows = App.data.subscriptions.slice();
 
@@ -582,6 +626,8 @@ function renderStreams() {
     row.addEventListener('click', open);
     row.addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); open(); } });
   });
+
+  if (animate) markEntering(list);
 }
 
 // ─── Subscription modal (add / edit) ──────────────────────────────
@@ -746,7 +792,7 @@ function wireEvents() {
   document.addEventListener('keydown', e => { if (e.key === 'Escape') $$('.modal-overlay.open').forEach(m => m.classList.remove('open')); });
 
   // search
-  $('#search').addEventListener('input', e => { App.search = e.target.value; renderStreams(); });
+  $('#search').addEventListener('input', e => { App.search = e.target.value; renderStreams(false); });
 
   // status filters
   $$('#status-filters .chip').forEach(chip => chip.addEventListener('click', () => {

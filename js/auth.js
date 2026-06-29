@@ -657,7 +657,13 @@ const Auth = (() => {
   // (called directly from Settings).
   function setupScreen(title, html) {
     document.getElementById('account-setup-title').textContent = title;
-    document.getElementById('account-setup-body').innerHTML = html;
+    const body = document.getElementById('account-setup-body');
+    body.innerHTML = html;
+    // Re-trigger the swap fade on each screen change (no-op if the class
+    // isn't styled — keeps this module portable).
+    body.classList.remove('anim-swap');
+    void body.offsetWidth;            // force reflow so the animation restarts
+    body.classList.add('anim-swap');
     C.openModal('modal-account-setup');
   }
 
