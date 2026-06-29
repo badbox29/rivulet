@@ -1239,6 +1239,22 @@ function wireAuthSettings() {
   if (last) last.textContent = App.data.lastSyncTime ? new Date(App.data.lastSyncTime).toLocaleString() : 'Never';
 }
 
+// Settings already persist on change; the Save button is the explicit,
+// discoverable confirm — it also commits the worker-URL field in case it
+// wasn't blurred, re-renders, syncs, and closes. (Notifications keep their
+// own permission-aware handler and aren't re-toggled here.)
+function saveSettings() {
+  App.data.settings.currency = $('#settings-currency').value;
+  App.data.settings.flowView = $('#settings-flowview').value;
+  const w = $('#settings-worker-url');
+  if (w) App.data.workerUrl = w.value.trim().replace(/\/+$/, '');
+  markDirty();
+  renderApp();
+  toast('Settings saved');
+  closeModal('modal-settings');
+  if (!Auth.isGuest()) pushToWorker();
+}
+
 // ─── Backup ───────────────────────────────────────────────────────
 function exportBackup() {
   const blob = new Blob([JSON.stringify(App.data, null, 2)], { type: 'application/json' });
@@ -1340,6 +1356,7 @@ function wireEvents() {
   $('#settings-upgrade-google-btn').addEventListener('click', () => { closeModal('modal-settings'); Auth.showGoogleUpgradeFlow(); });
   $('#settings-account-btn').addEventListener('click', () => { closeModal('modal-settings'); Auth.isGuest() ? Auth.showGuestSwitchConfirm() : Auth.showAccountSetup(); });
   $('#settings-token-copy').addEventListener('click', () => navigator.clipboard?.writeText(App.data.userToken || '').then(() => toast('Token copied')));
+  $('#settings-save').addEventListener('click', saveSettings);
 }
 
 // ─── Boot ─────────────────────────────────────────────────────────
