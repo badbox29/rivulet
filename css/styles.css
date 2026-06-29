@@ -50,6 +50,12 @@
   --shadow: 0 1px 2px rgba(10,38,48,.05), 0 8px 24px rgba(10,38,48,.06);
   --shadow-lg: 0 12px 48px rgba(10,38,48,.18);
 
+  /* ── Motion ── (tune here; everything references these) */
+  --motion-fast: .16s;
+  --motion:      .30s;
+  --motion-slow: .58s;
+  --ease-out:    cubic-bezier(.22, 1, .36, 1);   /* settles like water finding level */
+
   --maxw: 880px;
 }
 
@@ -160,6 +166,7 @@ code { font-family: var(--font-mono); }
   height: 100%; border-radius: 4px;
   background: linear-gradient(90deg, var(--current), var(--flow) 85%, rgba(159,221,224,.35));
   position: relative; min-width: 8px;
+  transition: width var(--motion-slow) var(--ease-out);
 }
 .stream-bar-fill::after {
   content: '▶'; position: absolute; right: -11px; top: 50%; transform: translateY(-50%);
@@ -194,6 +201,7 @@ code { font-family: var(--font-mono); }
 .chip {
   border: 1px solid var(--line); background: transparent; cursor: pointer;
   padding: .28rem .7rem; border-radius: 999px; font: inherit; font-size: .8rem; color: var(--muted);
+  transition: background var(--motion-fast) ease, border-color var(--motion-fast) ease, color var(--motion-fast) ease;
 }
 .chip:hover { border-color: var(--current); color: var(--deep); }
 .chip.is-active { background: var(--abyss); border-color: var(--abyss); color: #EAF4F5; }
@@ -345,6 +353,26 @@ select.input { appearance: none; background-image: linear-gradient(45deg, transp
 .reminder-detail { font-size: .8rem; color: var(--muted); margin-top: .15rem; }
 .reminder-dismiss { flex: none; }
 
+/* ── Motion ──────────────────────────────────────────────────── */
+/* Rows rise into place like silt settling; staggered by render order.
+   Applied only on meaningful renders (load, edit, filter) — never on
+   every search keystroke (app.js gates that). */
+@keyframes riv-rise {
+  from { opacity: 0; transform: translateY(7px); }
+  to   { opacity: 1; transform: none; }
+}
+.riv-enter { animation: riv-rise var(--motion) var(--ease-out) both; }
+
+/* Content swapped into an open modal (wizard screen → screen) fades in. */
+@keyframes riv-fade {
+  from { opacity: 0; transform: translateY(4px); }
+  to   { opacity: 1; transform: none; }
+}
+.anim-swap { animation: riv-fade var(--motion-fast) var(--ease-out) both; }
+
+/* Smooth the stream-row hover wash. */
+.stream-row { transition: background var(--motion-fast) ease; }
+
 /* ── Responsive ──────────────────────────────────────────────── */
 @media (max-width: 560px) {
   .topbar-search { display: none; }
@@ -355,4 +383,6 @@ select.input { appearance: none; background-image: linear-gradient(45deg, transp
 
 @media (prefers-reduced-motion: reduce) {
   .modal, .toast { animation: none; }
+  .riv-enter, .anim-swap { animation: none; }
+  .stream-bar-fill, .chip, .stream-row { transition: none; }
 }
