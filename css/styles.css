@@ -207,6 +207,23 @@ code { font-family: var(--font-mono); }
 }
 .scope-chip:hover { border-color: var(--current); }
 
+/* ── Bulk import modal ───────────────────────────────────────── */
+.import-intro { color: var(--deep); margin: 0 0 .5rem; }
+.import-steps { margin: 0 0 .8rem; padding-left: 1.2rem; color: var(--muted); font-size: .9rem; }
+.import-steps li { margin: .15rem 0; }
+.import-note { font-size: .8rem; color: var(--muted); background: var(--paper-2); border-radius: var(--r-sm); padding: .6rem .7rem; margin: 0 0 1rem; line-height: 1.5; }
+.import-note code { font-family: var(--font-mono); font-size: .92em; background: var(--surface); padding: .05rem .3rem; border-radius: 4px; }
+.import-download { width: 100%; }
+.import-divider { height: 1px; background: var(--line); margin: 1.1rem 0; }
+.import-file { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0 0 0 0); border: 0; }
+.import-pick { width: 100%; cursor: pointer; }
+.import-result { margin-top: .9rem; }
+.import-result:empty { margin-top: 0; }
+.import-ok { color: var(--reclaimed); font-weight: 600; margin: .2rem 0; }
+.import-warn { color: var(--ember); font-weight: 500; margin: .2rem 0; }
+.import-errors { margin: .4rem 0 0; padding-left: 1.1rem; font-size: .82rem; color: var(--muted); }
+.import-errors li { margin: .1rem 0; }
+
 /* ── Panels ──────────────────────────────────────────────────── */
 .panel {
   background: var(--surface); border: 1px solid var(--line);
