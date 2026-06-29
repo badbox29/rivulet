@@ -224,6 +224,36 @@ code { font-family: var(--font-mono); }
 .import-errors { margin: .4rem 0 0; padding-left: 1.1rem; font-size: .82rem; color: var(--muted); }
 .import-errors li { margin: .1rem 0; }
 
+/* ── Projection chart ────────────────────────────────────────── */
+.proj-toggle-btn {
+  border: 0; background: transparent; cursor: pointer;
+  padding: .3rem .7rem; border-radius: 999px;
+  font: inherit; font-size: .78rem; font-weight: 500; color: var(--muted);
+  transition: background var(--motion-fast) ease, color var(--motion-fast) ease;
+}
+.proj-toggle-btn.is-active { background: var(--surface); color: var(--abyss); box-shadow: var(--shadow); }
+.projection-headline { margin: 0 0 .6rem; color: var(--deep); font-size: .95rem; }
+.projection-headline b { font-family: var(--font-display); font-weight: 800; color: var(--abyss); font-variant-numeric: tabular-nums; }
+.projection-chart { width: 100%; }
+.proj-svg { width: 100%; height: auto; display: block; }
+.chart-grid { stroke: var(--line); stroke-width: 1; }
+.chart-ylabel, .chart-xlabel { fill: var(--faint); font-family: var(--font-mono); font-size: 10px; }
+
+/* approximate-FX note in the hero substats */
+.fx-note { color: var(--faint); font-style: italic; cursor: help; }
+
+/* ── Price-history sparkline (in the stream modal) ───────────── */
+.price-history { margin-bottom: 1rem; padding: .7rem .8rem; background: var(--paper-2); border-radius: var(--r-sm); }
+.ph-head { display: flex; align-items: baseline; justify-content: space-between; margin-bottom: .2rem; }
+.ph-title { font-size: .78rem; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; }
+.ph-chg { font-size: .78rem; font-weight: 600; font-variant-numeric: tabular-nums; }
+.ph-chg.ph-up { color: var(--danger); }
+.ph-chg.ph-down { color: var(--reclaimed); }
+.ph-chg.ph-flat { color: var(--muted); }
+.ph-svg { width: 100%; height: auto; display: block; }
+.ph-lbl { fill: var(--deep); font-family: var(--font-mono); font-size: 11px; font-weight: 500; }
+.ph-date { fill: var(--faint); font-family: var(--font-mono); font-size: 9px; }
+
 /* ── Panels ──────────────────────────────────────────────────── */
 .panel {
   background: var(--surface); border: 1px solid var(--line);
