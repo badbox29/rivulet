@@ -518,24 +518,22 @@ function renderHero() {
   $('#flow-substats').innerHTML = bits.join(' · ');
 
   // Stream bars — active subs, widest = costliest, draining rightward.
-  // Render at 0 width, then flow out to target so the dashboard fills like water.
+  // Each bar renders at its target width; the riv-fill keyframe sweeps it in
+  // from 0 on creation, so this replays on every hero render (load,
+  // monthly/annual, by-category). Disabled under prefers-reduced-motion in CSS.
   const ranked = subs.filter(isActive).map(s => ({ s, m: monthly(s) })).sort((a, b) => b.m - a.m).slice(0, 8);
   const max = ranked.length ? ranked[0].m : 1;
-  const reduce = prefersReducedMotion();
   $('#flow-streams').innerHTML = ranked.map(({ s, m }) => {
     const target = Math.max(6, (m / max) * 100);
     return `
     <div class="stream-bar-row">
       <span class="stream-bar-name">${esc(s.name || 'Untitled')}</span>
       <div class="stream-bar-track">
-        <div class="stream-bar-fill" data-w="${target.toFixed(2)}" style="width:${reduce ? target.toFixed(2) + '%' : '0%'};"></div>
+        <div class="stream-bar-fill" style="width:${target.toFixed(2)}%;"></div>
       </div>
       <span class="stream-bar-amt">${formatMoney(m)}</span>
     </div>`;
   }).join('');
-  if (!reduce) {
-    requestAnimationFrame(() => $$('#flow-streams .stream-bar-fill').forEach(el => { el.style.width = el.dataset.w + '%'; }));
-  }
 }
 
 function renderUpcoming() {
