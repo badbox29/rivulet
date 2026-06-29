@@ -166,7 +166,7 @@ code { font-family: var(--font-mono); }
   height: 100%; border-radius: 4px;
   background: linear-gradient(90deg, var(--current), var(--flow) 85%, rgba(159,221,224,.35));
   position: relative; min-width: 8px;
-  transition: width var(--motion-slow) var(--ease-out);
+  animation: riv-fill var(--motion-slow) var(--ease-out);
 }
 .stream-bar-fill::after {
   content: '▶'; position: absolute; right: -11px; top: 50%; transform: translateY(-50%);
@@ -363,6 +363,11 @@ select.input { appearance: none; background-image: linear-gradient(45deg, transp
 }
 .riv-enter { animation: riv-rise var(--motion) var(--ease-out) both; }
 
+/* Bars sweep in from nothing, left to right, on every hero render. */
+@keyframes riv-fill {
+  from { width: 0; min-width: 0; }
+}
+
 /* Content swapped into an open modal (wizard screen → screen) fades in. */
 @keyframes riv-fade {
   from { opacity: 0; transform: translateY(4px); }
@@ -383,6 +388,6 @@ select.input { appearance: none; background-image: linear-gradient(45deg, transp
 
 @media (prefers-reduced-motion: reduce) {
   .modal, .toast { animation: none; }
-  .riv-enter, .anim-swap { animation: none; }
-  .stream-bar-fill, .chip, .stream-row { transition: none; }
+  .riv-enter, .anim-swap, .stream-bar-fill { animation: none; }
+  .chip, .stream-row { transition: none; }
 }
