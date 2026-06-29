@@ -62,7 +62,9 @@ function defaultData() {
     firstName: '', lastName: '', username: '',
     subscriptions:  [],
     paymentMethods: [],
-    settings: { currency: 'USD', flowView: 'monthly', reminderLeads: [7, 1] },
+    settings: { currency: 'USD', flowView: 'monthly', reminderLeads: [7, 1], notifyBrowser: false },
+    dismissedReminders: {},   // reminderId → date dismissed (re-surfaces next cycle)
+    lastNotifyDate: '',       // YYYY-MM-DD of the last browser notification (once/day)
     lastSyncTime: 0, pendingSync: false, lastModified: Date.now(),
   };
 }
@@ -74,6 +76,8 @@ function mergeData(raw) {
     ...d, ...raw,
     subscriptions:  Array.isArray(raw.subscriptions)  ? raw.subscriptions  : d.subscriptions,
     paymentMethods: Array.isArray(raw.paymentMethods) ? raw.paymentMethods : d.paymentMethods,
+    dismissedReminders: (raw.dismissedReminders && typeof raw.dismissedReminders === 'object')
+      ? raw.dismissedReminders : d.dismissedReminders,
     settings: (raw.settings && typeof raw.settings === 'object')
       ? { ...d.settings, ...raw.settings,
           reminderLeads: Array.isArray(raw.settings.reminderLeads) ? raw.settings.reminderLeads : d.settings.reminderLeads }
@@ -88,6 +92,7 @@ function newSubscription() {
     id: uid(), name: '', amount: 0, currency: App.data?.settings?.currency || 'USD',
     frequency: 'monthly', category: 'Other', nextChargeDate: '', autoRenews: true,
     paymentLabel: '', status: 'active', lastUsedDate: '', notes: '',
+    taxIncluded: true, noticeDays: 0,
     priceHistory: [], createdAt: now, updatedAt: now,
   };
 }
@@ -164,6 +169,139 @@ function whenLabel(days) {
   if (days === 0) return 'today';
   if (days === 1) return 'tomorrow';
   return `in ${days} days`;
+}
+
+// ─── Price increases & savings ────────────────────────────────────
+function pctChange(from, to) { return from ? ((to - from) / from) * 100 : null; }
+
+// latestIncrease(sub) — the most recent price-history step, if it was a rise.
+function latestIncrease(sub) {
+  const h = (sub.priceHistory || []).filter(p => p && typeof p.amount === 'number');
+  if (h.length < 2) return null;
+  const last = h[h.length - 1], prev = h[h.length - 2];
+  if (last.amount > prev.amount) {
+    return { from: prev.amount, to: last.amount, pct: pctChange(prev.amount, last.amount), date: last.date };
+  }
+  return null;
+}
+function recentIncrease(sub, withinDays = 90) {
+  const inc = latestIncrease(sub);
+  if (!inc) return null;
+  const since = daysSince(inc.date);
+  return (since == null || since <= withinDays) ? inc : null;
+}
+
+// Monthly cost currently going to leaks (active streams unused > LEAK_DAYS).
+function leakMonthly() {
+  return App.data.subscriptions.filter(isLeak).reduce((sum, s) => sum + monthly(s), 0);
+}
+
+// ─── Reminders engine ─────────────────────────────────────────────
+// Surfaces what needs attention: upcoming renewals (by lead time), cancel-by
+// deadlines (notice periods), trial endings, and recent price increases.
+// Each reminder has a stable id within its billing cycle, so dismissing one
+// hides it until the next cycle (when the date — and thus the id — changes).
+const REMINDER_OVERDUE_GRACE = 14;  // days after a passed date we still nudge
+
+function reminderDismissed(id) {
+  return !!(App.data.dismissedReminders && App.data.dismissedReminders[id]);
+}
+
+function computeReminders() {
+  const out   = [];
+  const leads = (App.data.settings.reminderLeads || [7, 1]).slice().sort((a, b) => b - a);
+  const maxLead = leads.length ? leads[0] : 7;
+  const minLead = leads.length ? leads[leads.length - 1] : 1;
+  const push = r => { if (!reminderDismissed(r.id)) out.push(r); };
+
+  for (const s of App.data.subscriptions) {
+    const name = s.name || 'Untitled';
+    const amt  = formatMoney(s.amount, s.currency);
+
+    // Upcoming renewal (active)
+    if (s.status === 'active' && s.nextChargeDate) {
+      const d = daysUntil(s.nextChargeDate);
+      if (d != null && d >= 0 && d <= maxLead) {
+        push({ id: `renewal:${s.id}:${s.nextChargeDate}`, subId: s.id, type: 'renewal',
+          days: d, severity: d <= minLead ? 'due' : 'soon',
+          title: `${name} renews ${whenLabel(d)}`, detail: amt });
+      } else if (d != null && d < 0 && d >= -REMINDER_OVERDUE_GRACE && s.autoRenews) {
+        push({ id: `renewal-passed:${s.id}:${s.nextChargeDate}`, subId: s.id, type: 'renewal',
+          days: d, severity: 'overdue',
+          title: `${name} renewal date has passed`, detail: 'Update the next charge date to keep totals accurate.' });
+      }
+    }
+
+    // Cancel-by deadline (active + a notice period)
+    if (s.status === 'active' && s.nextChargeDate && (s.noticeDays || 0) > 0) {
+      const d = daysUntil(s.nextChargeDate);
+      if (d != null) {
+        const deadline = d - s.noticeDays;   // days until the cancel-by date
+        if (deadline <= 7 && deadline >= -2) {
+          push({ id: `notice:${s.id}:${s.nextChargeDate}`, subId: s.id, type: 'notice',
+            days: deadline, severity: deadline <= 1 ? 'due' : 'soon',
+            title: deadline < 0
+              ? `${name}: cancel-by date has passed`
+              : `${name}: cancel within ${deadline}d to avoid the charge`,
+            detail: `Needs ${s.noticeDays}d notice before the ${amt} charge.` });
+        }
+      }
+    }
+
+    // Trial ending
+    if (s.status === 'trial' && s.nextChargeDate) {
+      const d = daysUntil(s.nextChargeDate);
+      if (d != null && d >= 0 && d <= Math.max(maxLead, 7)) {
+        push({ id: `trial:${s.id}:${s.nextChargeDate}`, subId: s.id, type: 'trial',
+          days: d, severity: d <= minLead ? 'due' : 'soon',
+          title: `${name} trial ends ${whenLabel(d)}`, detail: `Then bills ${amt}. Cancel before to avoid it.` });
+      } else if (d != null && d < 0 && d >= -REMINDER_OVERDUE_GRACE) {
+        push({ id: `trial-passed:${s.id}:${s.nextChargeDate}`, subId: s.id, type: 'trial',
+          days: d, severity: 'overdue',
+          title: `${name} trial period has ended`, detail: 'Update its status if it converted to a paid plan.' });
+      }
+    }
+
+    // Recent price increase (any status)
+    const inc = recentIncrease(s, 90);
+    if (inc) {
+      push({ id: `increase:${s.id}:${inc.date}`, subId: s.id, type: 'increase',
+        days: null, severity: 'info',
+        title: `${name} price went up`,
+        detail: `${formatMoney(inc.from, s.currency)} → ${formatMoney(inc.to, s.currency)} (+${inc.pct.toFixed(0)}%)` });
+    }
+  }
+
+  const rank = { overdue: 0, due: 1, soon: 2, info: 3 };
+  out.sort((a, b) => (rank[a.severity] - rank[b.severity]) || ((a.days ?? 999) - (b.days ?? 999)));
+  return out;
+}
+
+function dismissReminder(id) {
+  App.data.dismissedReminders = App.data.dismissedReminders || {};
+  App.data.dismissedReminders[id] = new Date().toISOString().slice(0, 10);
+  markDirty();
+  renderRemindersList();
+  renderRemindersBadge();
+  if (!Auth.isGuest()) pushToWorker();
+}
+
+// Browser notification for due/overdue items — once per day, only if enabled
+// and permitted. Surfaced when the app is opened (no background push).
+function maybeNotify() {
+  if (!App.data.settings.notifyBrowser) return;
+  if (typeof Notification === 'undefined' || Notification.permission !== 'granted') return;
+  const today = new Date().toISOString().slice(0, 10);
+  if (App.data.lastNotifyDate === today) return;
+  const due = computeReminders().filter(r => r.severity === 'due' || r.severity === 'overdue');
+  if (!due.length) return;
+  App.data.lastNotifyDate = today; saveLocal();
+  const title = due.length === 1 ? 'Rivulet reminder' : `Rivulet · ${due.length} reminders`;
+  const body  = due.length === 1 ? due[0].title : due.slice(0, 3).map(r => r.title).join('\n');
+  try {
+    const n = new Notification(title, { body, tag: 'rivulet-reminders' });
+    n.onclick = () => { window.focus(); openReminders(); n.close(); };
+  } catch {}
 }
 
 // ─── Worker sync ──────────────────────────────────────────────────
@@ -265,11 +403,53 @@ function renderApp() {
   $('#hero').hidden = !has;
   $('#streams-section').hidden = !has;
 
+  renderRemindersBadge();
+
   if (!has) { $('#upcoming-section').hidden = true; return; }
 
   renderHero();
   renderUpcoming();
   renderStreams();
+}
+
+// ─── Reminders UI ─────────────────────────────────────────────────
+function renderRemindersBadge() {
+  const n = computeReminders().length;
+  const badge = $('#reminders-badge');
+  if (!badge) return;
+  badge.textContent = n > 9 ? '9+' : String(n);
+  badge.style.display = n ? '' : 'none';
+}
+
+function openReminders() {
+  renderRemindersList();
+  openModal('modal-reminders');
+}
+
+function renderRemindersList() {
+  const list = $('#reminders-list');
+  if (!list) return;
+  const items = computeReminders();
+  if (!items.length) {
+    list.innerHTML = `<p class="muted" style="padding:1.5rem 0;text-align:center;">You're all caught up — no reminders right now. 🌊</p>`;
+    return;
+  }
+  list.innerHTML = items.map(r => `
+    <div class="reminder-row sev-${r.severity}">
+      <div class="reminder-body" data-sub="${esc(r.subId)}" role="button" tabindex="0">
+        <div class="reminder-title">${esc(r.title)}</div>
+        <div class="reminder-detail">${esc(r.detail)}</div>
+      </div>
+      <button class="btn btn-ghost btn-sm reminder-dismiss" data-id="${esc(r.id)}">Dismiss</button>
+    </div>`).join('');
+
+  $$('#reminders-list .reminder-body').forEach(body => {
+    const open = () => { closeModal('modal-reminders'); openSubModal(body.dataset.sub); };
+    body.addEventListener('click', open);
+    body.addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); open(); } });
+  });
+  $$('#reminders-list .reminder-dismiss').forEach(b =>
+    b.addEventListener('click', e => { e.stopPropagation(); dismissReminder(b.dataset.id); }));
 }
 
 function renderHero() {
@@ -285,6 +465,8 @@ function renderHero() {
   const renewWeek = subs.filter(s => isActive(s)).filter(s => { const d = daysUntil(s.nextChargeDate); return d != null && d >= 0 && d <= 7; }).length;
   const trials = subs.filter(s => s.status === 'trial').length;
   const leaks = subs.filter(isLeak).length;
+  const reclaim = leakMonthly();
+  const increases = subs.filter(s => recentIncrease(s, 90)).length;
   const other = period === 'annual'
     ? `${formatMoney(monthlyTotal)}/mo`
     : `${formatMoney(monthlyTotal * 12)}/year`;
@@ -295,7 +477,8 @@ function renderHero() {
   ];
   if (renewWeek) bits.push(`<b>${renewWeek}</b> renew this week`);
   if (trials)    bits.push(`<b>${trials}</b> ${trials === 1 ? 'trial' : 'trials'}`);
-  if (leaks)     bits.push(`<span class="leak-stat">${leaks} ${leaks === 1 ? 'leak' : 'leaks'}</span>`);
+  if (increases) bits.push(`<span class="leak-stat">${increases} price ${increases === 1 ? 'rise' : 'rises'}</span>`);
+  if (leaks)     bits.push(`<span class="leak-stat">${leaks} ${leaks === 1 ? 'leak' : 'leaks'}${reclaim > 0 ? ` · reclaim ${formatMoney(reclaim)}/mo` : ''}</span>`);
   $('#flow-substats').innerHTML = bits.join(' · ');
 
   // Stream bars — active subs, widest = costliest, draining rightward
@@ -424,6 +607,8 @@ function openSubModal(id = null) {
   $('#sub-status').value    = sub.status;
   $('#sub-payment').value   = sub.paymentLabel;
   $('#sub-lastused').value  = sub.lastUsedDate;
+  $('#sub-notice').value    = sub.noticeDays || '';
+  $('#sub-tax').checked      = sub.taxIncluded !== false;
   $('#sub-autorenew').checked = !!sub.autoRenews;
   $('#sub-notes').value     = sub.notes;
   $('#sub-status-msg').textContent = '';
@@ -449,6 +634,8 @@ function saveSubscription() {
     status:    $('#sub-status').value,
     paymentLabel: $('#sub-payment').value.trim(),
     lastUsedDate: $('#sub-lastused').value,
+    noticeDays: Math.max(0, parseInt($('#sub-notice').value, 10) || 0),
+    taxIncluded: $('#sub-tax').checked,
     autoRenews: $('#sub-autorenew').checked,
     notes: $('#sub-notes').value.trim(),
     updatedAt: Date.now(),
@@ -505,6 +692,7 @@ function openSettings() {
   fillSelect($('#settings-currency'), CURRENCIES, c => c, c => c);
   $('#settings-currency').value = App.data.settings.currency;
   $('#settings-flowview').value = App.data.settings.flowView;
+  $('#settings-notify').checked = !!App.data.settings.notifyBrowser;
   wireAuthSettings();
   openModal('modal-settings');
 }
@@ -543,6 +731,7 @@ async function importBackup(file) {
 // ─── Event wiring ─────────────────────────────────────────────────
 function wireEvents() {
   $('#btn-settings').addEventListener('click', openSettings);
+  $('#btn-reminders').addEventListener('click', openReminders);
   $('#btn-add').addEventListener('click', () => openSubModal());
   $('#btn-add-empty').addEventListener('click', () => openSubModal());
 
@@ -574,6 +763,17 @@ function wireEvents() {
   // settings: preferences
   $('#settings-currency').addEventListener('change', e => { App.data.settings.currency = e.target.value; markDirty(); renderApp(); });
   $('#settings-flowview').addEventListener('change', e => { App.data.settings.flowView = e.target.value; saveLocal(); renderHero(); });
+  $('#settings-notify').addEventListener('change', async e => {
+    if (e.target.checked) {
+      if (typeof Notification === 'undefined') { toast('This browser does not support notifications'); e.target.checked = false; return; }
+      let perm = Notification.permission;
+      if (perm === 'default') perm = await Notification.requestPermission();
+      if (perm !== 'granted') { toast('Notifications are blocked — enable them in your browser settings'); e.target.checked = false; App.data.settings.notifyBrowser = false; markDirty(); return; }
+      App.data.settings.notifyBrowser = true; markDirty(); toast('Browser reminders on');
+    } else {
+      App.data.settings.notifyBrowser = false; markDirty();
+    }
+  });
 
   // settings: backup
   $('#btn-export').addEventListener('click', exportBackup);
@@ -633,6 +833,7 @@ async function boot() {
   updateSyncIndicator();
   if (!Auth.isGuest()) startSyncPing();
   maybeSync();
+  maybeNotify();
 }
 
 document.addEventListener('DOMContentLoaded', boot);
