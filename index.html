@@ -66,6 +66,20 @@
     <div id="flow-streams" class="flow-streams"></div>
   </section>
 
+  <!-- Projection: spend over time -->
+  <section id="projection-section" class="panel" hidden>
+    <div class="panel-head">
+      <h2 class="panel-title">Projected flow <span class="panel-sub">if nothing changes</span></h2>
+      <div class="flow-toggle proj-toggle" role="group" aria-label="Projection horizon">
+        <button class="proj-toggle-btn" data-months="6">6 mo</button>
+        <button class="proj-toggle-btn is-active" data-months="12">12 mo</button>
+        <button class="proj-toggle-btn" data-months="24">24 mo</button>
+      </div>
+    </div>
+    <p id="projection-headline" class="projection-headline"></p>
+    <div id="projection-chart" class="projection-chart"></div>
+  </section>
+
   <!-- Upcoming charges -->
   <section id="upcoming-section" class="panel" hidden>
     <div class="panel-head">
@@ -196,6 +210,8 @@
         <textarea class="input" id="sub-notes" rows="2" placeholder="Keep until October… cancellation is a nightmare…"></textarea>
       </div>
 
+      <div id="price-history" class="price-history" style="display:none;"></div>
+
       <div id="sub-status-msg" class="form-msg"></div>
 
       <div class="modal-actions">
@@ -251,8 +267,9 @@
         <div class="settings-section-body">
           <div class="form-row">
             <div class="form-group">
-              <label class="form-label" for="settings-currency">Default currency</label>
+              <label class="form-label" for="settings-currency">Display currency</label>
               <select class="input" id="settings-currency"></select>
+              <div class="form-hint">Totals show in this currency; new streams default to it.</div>
             </div>
             <div class="form-group">
               <label class="form-label" for="settings-flowview">Flow shows</label>
