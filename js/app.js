@@ -54,6 +54,7 @@ const App = {
   editingId: null,      // id of subscription being edited, or null when adding
   heroView: 'stream',   // 'stream' | 'category' — what the hero bars show
   categoryFilter: null, // selected category name, or null
+  projMonths: 12,       // projection horizon (6 | 12 | 24)
 };
 
 // ─── Data model ───────────────────────────────────────────────────
@@ -136,15 +137,36 @@ function freqOf(id)   { return FREQUENCIES.find(f => f.id === id) || FREQUENCIES
 function monthly(sub) { return freqOf(sub.frequency).toMonthly(Number(sub.amount) || 0); }
 function isActive(sub){ return sub.status === 'active'; }
 
-function activeMonthlyTotal() {
-  return App.data.subscriptions.filter(isActive).reduce((sum, s) => sum + monthly(s), 0);
+// ── Currency normalization ──
+// Approximate, static FX rates expressed as USD per 1 unit. Good enough to make
+// mixed-currency totals meaningful; clearly labeled as approximate in the UI.
+// Single-currency portfolios never touch these (convertAmount short-circuits).
+// Live or user-editable rates can replace this table later without touching callers.
+const FX_USD = { USD: 1, EUR: 1.08, GBP: 1.27, CAD: 0.73, AUD: 0.66, JPY: 0.0067, INR: 0.012, BRL: 0.18, MXN: 0.055 };
+function fxRate(cur) { return FX_USD[cur] || 1; }
+function displayCurrency() { return (App.data && App.data.settings && App.data.settings.currency) || 'USD'; }
+function convertAmount(amount, from, to) {
+  const a = Number(amount) || 0;
+  if (!from || from === to) return a;
+  return a * fxRate(from) / fxRate(to);
+}
+// A subscription's monthly cost converted into the display currency.
+function normMonthly(sub) { return convertAmount(monthly(sub), sub.currency, displayCurrency()); }
+// True when active streams span more than one currency (drives the "approx" note).
+function hasMixedCurrencies() {
+  const cur = new Set(App.data.subscriptions.filter(isActive).map(s => s.currency || 'USD'));
+  return cur.size > 1;
 }
 
-// Monthly spend on active streams in one category.
+function activeMonthlyTotal() {
+  return App.data.subscriptions.filter(isActive).reduce((sum, s) => sum + normMonthly(s), 0);
+}
+
+// Monthly spend on active streams in one category, in the display currency.
 function categoryMonthly(cat) {
   return App.data.subscriptions
     .filter(s => isActive(s) && s.category === cat)
-    .reduce((sum, s) => sum + monthly(s), 0);
+    .reduce((sum, s) => sum + normMonthly(s), 0);
 }
 
 // Categories that have at least one active stream, with their monthly spend
@@ -155,13 +177,13 @@ function usedCategories() {
   for (const s of App.data.subscriptions) {
     if (!isActive(s)) continue;
     (agg[s.category] = agg[s.category] || { category: s.category, total: 0, count: 0 });
-    agg[s.category].total += monthly(s);
+    agg[s.category].total += normMonthly(s);
     agg[s.category].count += 1;
   }
   return Object.values(agg).sort((a, b) => b.total - a.total);
 }
 
-function formatMoney(n, currency = App.data.settings.currency) {
+function formatMoney(n, currency = displayCurrency()) {
   const v = Number(n) || 0;
   try {
     return new Intl.NumberFormat(undefined, {
@@ -218,7 +240,7 @@ function recentIncrease(sub, withinDays = 90) {
 
 // Monthly cost currently going to leaks (active streams unused > LEAK_DAYS).
 function leakMonthly() {
-  return App.data.subscriptions.filter(isLeak).reduce((sum, s) => sum + monthly(s), 0);
+  return App.data.subscriptions.filter(isLeak).reduce((sum, s) => sum + normMonthly(s), 0);
 }
 
 // ─── Reminders engine ─────────────────────────────────────────────
@@ -653,9 +675,10 @@ function renderApp() {
 
   renderRemindersBadge();
 
-  if (!has) { $('#upcoming-section').hidden = true; return; }
+  if (!has) { $('#upcoming-section').hidden = true; $('#projection-section').hidden = true; return; }
 
   renderHero();
+  renderProjection();
   renderUpcoming();
   renderStreams();
 }
@@ -748,6 +771,7 @@ function globalSubstats(annual) {
   if (trials)    bits.push(`<b>${trials}</b> ${trials === 1 ? 'trial' : 'trials'}`);
   if (increases) bits.push(`<span class="leak-stat">${increases} price ${increases === 1 ? 'rise' : 'rises'}</span>`);
   if (leaks)     bits.push(`<span class="leak-stat">${leaks} ${leaks === 1 ? 'leak' : 'leaks'}${reclaim > 0 ? ` · reclaim ${formatMoney(reclaim)}/mo` : ''}</span>`);
+  if (hasMixedCurrencies()) bits.push(`<span class="fx-note" title="Streams in other currencies are converted to ${displayCurrency()} at approximate rates.">≈ ${displayCurrency()}, approx FX</span>`);
   return bits.join(' · ');
 }
 
@@ -770,7 +794,7 @@ function categorySubstats(cat, annual) {
 // so this replays on every hero render. Disabled under reduced-motion in CSS.
 function renderStreamBars() {
   const ranked = App.data.subscriptions.filter(isActive)
-    .map(s => ({ s, m: monthly(s) })).sort((a, b) => b.m - a.m).slice(0, 8);
+    .map(s => ({ s, m: normMonthly(s) })).sort((a, b) => b.m - a.m).slice(0, 8);
   const max = ranked.length ? ranked[0].m : 1;
   $('#flow-streams').innerHTML = ranked.map(({ s, m }) => `
     <div class="stream-bar-row">
@@ -830,7 +854,7 @@ function renderUpcoming() {
   if (!upcoming.length) { section.hidden = true; return; }
   section.hidden = false;
 
-  const total = upcoming.reduce((sum, x) => sum + (Number(x.s.amount) || 0), 0);
+  const total = upcoming.reduce((sum, x) => sum + convertAmount(x.s.amount, x.s.currency, displayCurrency()), 0);
   $('#upcoming-total').textContent = formatMoney(total);
 
   $('#upcoming-list').innerHTML = upcoming.map(({ s, days }) => {
@@ -848,6 +872,118 @@ function renderUpcoming() {
   }).join('');
 
   markEntering($('#upcoming-list'));
+}
+
+// ─── Projections ──────────────────────────────────────────────────
+// Forecast cumulative spend over a horizon by walking each active stream's
+// charge dates forward and bucketing converted amounts by month.
+function stepDate(d, freq) {
+  const x = new Date(d);
+  switch (freq) {
+    case 'weekly':    x.setDate(x.getDate() + 7); break;
+    case 'quarterly': x.setMonth(x.getMonth() + 3); break;
+    case 'yearly':    x.setFullYear(x.getFullYear() + 1); break;
+    default:          x.setMonth(x.getMonth() + 1);
+  }
+  return x;
+}
+
+function chargeDatesWithin(sub, start, end) {
+  const out = [];
+  let anchor = parseDate(sub.nextChargeDate) || new Date(start); // no date → from today
+  let guard = 0;
+  while (anchor < start && guard++ < 3000) anchor = stepDate(anchor, sub.frequency);
+  let d = new Date(anchor); guard = 0;
+  while (d < end && guard++ < 3000) { out.push(new Date(d)); d = stepDate(d, sub.frequency); }
+  return out;
+}
+
+function projectSpend(months) {
+  const start = startOfToday();
+  const end = new Date(start); end.setMonth(end.getMonth() + months);
+  const disp = displayCurrency();
+  const buckets = new Array(months).fill(0);
+  for (const s of App.data.subscriptions) {
+    if (!isActive(s)) continue;
+    const amt = convertAmount(Number(s.amount) || 0, s.currency, disp);
+    if (amt <= 0) continue;
+    for (const d of chargeDatesWithin(s, start, end)) {
+      const mi = (d.getFullYear() - start.getFullYear()) * 12 + (d.getMonth() - start.getMonth());
+      if (mi >= 0 && mi < months) buckets[mi] += amt;
+    }
+  }
+  const cumulative = []; let run = 0;
+  for (let i = 0; i < months; i++) { run += buckets[i]; cumulative.push(run); }
+  return { months, buckets, cumulative, total: run, start, disp };
+}
+
+function niceCeil(v) {
+  if (v <= 0) return 1;
+  const mag = Math.pow(10, Math.floor(Math.log10(v)));
+  const n = v / mag;
+  const step = n <= 1 ? 1 : n <= 2 ? 2 : n <= 5 ? 5 : 10;
+  return step * mag;
+}
+
+function projectionSVG(p) {
+  const W = 720, H = 210, padL = 52, padR = 16, padT = 14, padB = 30;
+  const plotW = W - padL - padR, plotH = H - padT - padB;
+  const maxY = niceCeil(p.total || 1);
+  const n = p.months;
+  const xAt = i => padL + (i / n) * plotW;             // i: 0 = now … n = horizon end
+  const yAt = v => padT + plotH - (v / maxY) * plotH;
+  // points: now(0,0) then cumulative at month 1..n
+  const pts = [[0, 0], ...p.cumulative.map((v, idx) => [idx + 1, v])];
+  const line = pts.map((pt, k) => `${k ? 'L' : 'M'}${xAt(pt[0]).toFixed(1)} ${yAt(pt[1]).toFixed(1)}`).join(' ');
+  const area = `${line} L${xAt(n).toFixed(1)} ${yAt(0).toFixed(1)} L${xAt(0).toFixed(1)} ${yAt(0).toFixed(1)} Z`;
+
+  // y gridlines at 0, ½, max
+  const yTicks = [0, maxY / 2, maxY].map(v => {
+    const y = yAt(v);
+    return `<line class="chart-grid" x1="${padL}" y1="${y.toFixed(1)}" x2="${W - padR}" y2="${y.toFixed(1)}"/>
+            <text class="chart-ylabel" x="${padL - 8}" y="${(y + 3.5).toFixed(1)}" text-anchor="end">${esc(formatMoney(v))}</text>`;
+  }).join('');
+
+  // x labels — ~4 evenly spaced ticks plus "Now"
+  const ticks = 4;
+  const xLabels = Array.from({ length: ticks + 1 }, (_, k) => {
+    const i = Math.round((k / ticks) * n);
+    const dt = new Date(p.start); dt.setMonth(dt.getMonth() + i);
+    const label = i === 0 ? 'Now'
+      : (n > 12 ? dt.toLocaleString(undefined, { month: 'short', year: '2-digit' })
+                : dt.toLocaleString(undefined, { month: 'short' }));
+    return `<text class="chart-xlabel" x="${xAt(i).toFixed(1)}" y="${H - 10}" text-anchor="${k === 0 ? 'start' : k === ticks ? 'end' : 'middle'}">${esc(label)}</text>`;
+  }).join('');
+
+  const endX = xAt(n), endY = yAt(p.total);
+  return `
+  <svg viewBox="0 0 ${W} ${H}" class="proj-svg" role="img" aria-label="Projected cumulative spend">
+    <defs>
+      <linearGradient id="projGrad" x1="0" y1="0" x2="0" y2="1">
+        <stop offset="0%" stop-color="var(--flow)" stop-opacity="0.32"/>
+        <stop offset="100%" stop-color="var(--flow)" stop-opacity="0.02"/>
+      </linearGradient>
+    </defs>
+    ${yTicks}
+    <path d="${area}" fill="url(#projGrad)"/>
+    <path d="${line}" fill="none" stroke="var(--current)" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+    <circle cx="${endX.toFixed(1)}" cy="${endY.toFixed(1)}" r="4" fill="var(--current)"/>
+    ${xLabels}
+  </svg>`;
+}
+
+function renderProjection() {
+  const section = $('#projection-section');
+  if (!section) return;
+  const active = App.data.subscriptions.filter(isActive).length;
+  if (!active) { section.hidden = true; return; }
+  section.hidden = false;
+  const months = App.projMonths || 12;
+  $$('.proj-toggle-btn').forEach(b => b.classList.toggle('is-active', +b.dataset.months === months));
+  const p = projectSpend(months);
+  $('#projection-headline').innerHTML =
+    `≈ <b>${formatMoney(p.total)}</b> flows out over the next ${months} months`;
+  $('#projection-chart').innerHTML = projectionSVG(p);
 }
 
 function renderStreams(animate = true) {
@@ -923,6 +1059,50 @@ function renderStreams(animate = true) {
 }
 
 // ─── Subscription modal (add / edit) ──────────────────────────────
+// Per-stream price history as a small line chart: segments colored by
+// direction (a rise is ember/danger, a drop is reclaimed). Hidden until
+// there are at least two recorded price points.
+function renderPriceHistory(sub) {
+  const pts = (sub.priceHistory || []).filter(p => p && typeof p.amount === 'number')
+    .slice().sort((a, b) => String(a.date || '').localeCompare(String(b.date || '')));
+  if (pts.length < 2) return '';
+  const cur = sub.currency;
+  const W = 480, H = 112, padL = 10, padR = 10, padT = 24, padB = 20;
+  const plotW = W - padL - padR, plotH = H - padT - padB;
+  const amts = pts.map(p => p.amount);
+  let lo = Math.min(...amts), hi = Math.max(...amts);
+  if (hi === lo) { hi = lo + 1; lo = Math.max(0, lo - 1); }
+  const padY = (hi - lo) * 0.15; lo -= padY; hi += padY;
+  const n = pts.length;
+  const xAt = i => padL + (n === 1 ? 0.5 : i / (n - 1)) * plotW;
+  const yAt = v => padT + plotH - ((v - lo) / (hi - lo)) * plotH;
+
+  let segs = '';
+  for (let i = 1; i < n; i++) {
+    const a = pts[i - 1].amount, b = pts[i].amount;
+    const col = b > a ? 'var(--danger)' : b < a ? 'var(--reclaimed)' : 'var(--current)';
+    segs += `<line x1="${xAt(i - 1).toFixed(1)}" y1="${yAt(a).toFixed(1)}" x2="${xAt(i).toFixed(1)}" y2="${yAt(b).toFixed(1)}" stroke="${col}" stroke-width="2.5" stroke-linecap="round"/>`;
+  }
+  const dots = pts.map((p, i) => `<circle cx="${xAt(i).toFixed(1)}" cy="${yAt(p.amount).toFixed(1)}" r="3" fill="var(--surface)" stroke="var(--current)" stroke-width="1.6"/>`).join('');
+  const first = pts[0], last = pts[n - 1];
+  const chg = pctChange(first.amount, last.amount);
+  const chgTxt = chg == null ? '' : `${chg >= 0 ? '+' : ''}${chg.toFixed(0)}%`;
+  const chgCls = chg > 0 ? 'ph-up' : chg < 0 ? 'ph-down' : 'ph-flat';
+
+  return `
+    <div class="ph-head">
+      <span class="ph-title">Price history</span>
+      <span class="ph-chg ${chgCls}">${chgTxt} since ${esc(first.date || 'start')}</span>
+    </div>
+    <svg viewBox="0 0 ${W} ${H}" class="ph-svg" role="img" aria-label="Price history">
+      <text class="ph-lbl" x="${padL}" y="13" text-anchor="start">${esc(formatMoney(first.amount, cur))}</text>
+      <text class="ph-lbl" x="${W - padR}" y="13" text-anchor="end">${esc(formatMoney(last.amount, cur))}</text>
+      ${segs}${dots}
+      <text class="ph-date" x="${padL}" y="${H - 6}" text-anchor="start">${esc(first.date || '')}</text>
+      <text class="ph-date" x="${W - padR}" y="${H - 6}" text-anchor="end">${esc(last.date || '')}</text>
+    </svg>`;
+}
+
 function fillSelect(el, items, getVal, getLabel) {
   el.innerHTML = items.map(it => `<option value="${getVal(it)}">${getLabel(it)}</option>`).join('');
 }
@@ -960,6 +1140,13 @@ function openSubModal(id = null) {
   $('#sub-notes').value     = sub.notes;
   $('#sub-status-msg').textContent = '';
   $('#sub-delete').style.display = id ? '' : 'none';
+
+  const ph = $('#price-history');
+  if (ph) {
+    const html = id && sub ? renderPriceHistory(sub) : '';
+    ph.innerHTML = html;
+    ph.style.display = html ? '' : 'none';
+  }
 
   openModal('modal-sub');
   $('#sub-name').focus();
@@ -1119,6 +1306,12 @@ function wireEvents() {
     renderHero(); renderStreams();
   }));
   $('#cat-clear').addEventListener('click', () => { if (App.categoryFilter) selectCategory(App.categoryFilter); });
+
+  // projection horizon toggle
+  $$('.proj-toggle-btn').forEach(b => b.addEventListener('click', () => {
+    App.projMonths = +b.dataset.months;
+    renderProjection();
+  }));
 
   // settings: preferences
   $('#settings-currency').addEventListener('change', e => { App.data.settings.currency = e.target.value; markDirty(); renderApp(); });
