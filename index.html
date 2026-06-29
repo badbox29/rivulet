@@ -30,6 +30,7 @@
 
   <div class="topbar-actions">
     <span id="sync-indicator" class="sync-dot" title="Unsynced changes" style="display:none;"></span>
+    <button id="btn-import" class="icon-btn" title="Bulk import (CSV)" aria-label="Bulk import">↥</button>
     <button id="btn-reminders" class="icon-btn icon-btn-badge" title="Reminders" aria-label="Reminders">🔔<span id="reminders-badge" class="badge" style="display:none;">0</span></button>
     <button id="btn-settings" class="icon-btn" title="Settings" aria-label="Settings">⚙</button>
   </div>
@@ -119,6 +120,10 @@
       <button class="icon-btn modal-close" data-close="modal-sub" aria-label="Close">✕</button>
     </div>
     <div class="modal-body">
+      <div class="form-group" id="sub-template-group">
+        <label class="form-label" for="sub-template">Quick fill <span class="muted">— pick a popular service to autofill</span></label>
+        <select class="input" id="sub-template"></select>
+      </div>
       <div class="form-group">
         <label class="form-label" for="sub-name">Name</label>
         <input class="input" id="sub-name" placeholder="Netflix, Adobe, gym…"/>
@@ -200,6 +205,33 @@
           <button class="btn btn-primary" id="sub-save">Save stream</button>
         </div>
       </div>
+    </div>
+  </div>
+</div>
+
+<!-- ── Bulk import modal ───────────────────────────────────────── -->
+<div class="modal-overlay" id="modal-import" role="dialog" aria-modal="true" aria-labelledby="import-title">
+  <div class="modal">
+    <div class="modal-header">
+      <h2 class="modal-title" id="import-title">Bulk import</h2>
+      <button class="icon-btn modal-close" data-close="modal-import" aria-label="Close">✕</button>
+    </div>
+    <div class="modal-body">
+      <p class="import-intro">Bring in many streams at once from a spreadsheet. Here's how:</p>
+      <ol class="import-steps">
+        <li>Download the template below.</li>
+        <li>Add one row per subscription — keep the header row as-is.</li>
+        <li>Save it as <b>.csv</b> and upload it here.</li>
+      </ol>
+      <p class="import-note">Dates use <code>YYYY-MM-DD</code>. Yes/no columns (tax included, auto-renews, email alert) accept <code>yes</code> or <code>no</code>. Unknown categories fall back to <b>Other</b>; <b>email alert</b> defaults to <b>no</b>. Imported rows are added — existing streams aren't touched.</p>
+
+      <button id="import-download" class="btn btn-ghost import-download">↧ Download CSV template</button>
+
+      <div class="import-divider"></div>
+
+      <input type="file" id="import-file" accept=".csv,text/csv" class="import-file"/>
+      <label for="import-file" class="btn btn-primary import-pick">Choose CSV file to import…</label>
+      <div id="import-result" class="import-result" aria-live="polite"></div>
     </div>
   </div>
 </div>
