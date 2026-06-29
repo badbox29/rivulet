@@ -22,8 +22,10 @@ const STORAGE_DISMISS_KEY = 'riv_token_upgrade_dismissed';
 const SYNC_THRESHOLD_MS      = 30 * 1000;
 const SYNC_CHECK_INTERVAL_MS = 15 * 1000;
 
-const CATEGORIES = ['Entertainment', 'Productivity', 'Development', 'Cloud',
-  'Gaming', 'Music', 'News', 'Fitness', 'Family', 'Utilities', 'Insurance', 'Other'];
+const CATEGORIES = ['Automotive', 'Cloud', 'Communication', 'Development', 'Education',
+  'Entertainment', 'Family', 'Finance', 'Fitness', 'Food', 'Gaming', 'Health', 'Home',
+  'Insurance', 'Music', 'News', 'Pets', 'Productivity', 'Security', 'Shopping', 'Travel',
+  'Utilities', 'Other'];
 
 const FREQUENCIES = [
   { id: 'weekly',    label: 'Weekly',    per: 'wk', toMonthly: a => a * 52 / 12 },
