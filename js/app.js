@@ -783,9 +783,9 @@ function wireEvents() {
   $('#settings-create-account').addEventListener('click', () => { closeModal('modal-settings'); Auth.showSetupFresh(); });
   $('#settings-worker-url').addEventListener('change', e => { App.data.workerUrl = e.target.value.trim().replace(/\/+$/, ''); saveLocal(); });
   $('#settings-sync-now-btn').addEventListener('click', async () => { const ok = await pushToWorker(); toast(ok ? 'Synced ✓' : 'Could not sync — check your connection'); wireAuthSettings(); });
-  $('#settings-token-change').addEventListener('click', () => Auth.showSetupLoadToken());
-  $('#settings-upgrade-google-btn').addEventListener('click', () => Auth.showGoogleUpgradeFlow());
-  $('#settings-account-btn').addEventListener('click', () => { Auth.isGuest() ? Auth.showGuestSwitchConfirm() : Auth.showAccountSetup(); });
+  $('#settings-token-change').addEventListener('click', () => { closeModal('modal-settings'); Auth.showSetupLoadToken(); });
+  $('#settings-upgrade-google-btn').addEventListener('click', () => { closeModal('modal-settings'); Auth.showGoogleUpgradeFlow(); });
+  $('#settings-account-btn').addEventListener('click', () => { closeModal('modal-settings'); Auth.isGuest() ? Auth.showGuestSwitchConfirm() : Auth.showAccountSetup(); });
   $('#settings-token-copy').addEventListener('click', () => navigator.clipboard?.writeText(App.data.userToken || '').then(() => toast('Token copied')));
 }
 
