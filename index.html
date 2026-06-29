@@ -1,0 +1,309 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>Rivulet — where your money flows</title>
+
+<!-- Google Identity Services. Signals auth.js's waitForGIS(). -->
+<script src="https://accounts.google.com/gsi/client" async
+        onload="window.gisReady=true;window.dispatchEvent(new Event('gis-ready'))"></script>
+
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,400;12..96,600;12..96,700;12..96,800&family=Inter+Tight:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+
+<link rel="stylesheet" href="styles.css"/>
+</head>
+<body>
+
+<!-- ── Top bar ─────────────────────────────────────────────────── -->
+<header class="topbar">
+  <div class="brand">
+    <span class="brand-mark" aria-hidden="true">≈</span>
+    <span class="brand-name">Rivulet</span>
+  </div>
+
+  <div class="topbar-search">
+    <input id="search" class="search-input" type="search" placeholder="Search streams…" autocomplete="off"/>
+  </div>
+
+  <div class="topbar-actions">
+    <span id="sync-indicator" class="sync-dot" title="Unsynced changes" style="display:none;"></span>
+    <button id="btn-settings" class="icon-btn" title="Settings" aria-label="Settings">⚙</button>
+  </div>
+</header>
+
+<!-- ── Main ────────────────────────────────────────────────────── -->
+<main id="app" class="app">
+
+  <!-- Hero: the flow -->
+  <section id="hero" class="hero" hidden>
+    <div class="hero-head">
+      <p class="eyebrow">Monthly flow</p>
+      <div class="flow-toggle" role="group" aria-label="Flow period">
+        <button class="flow-toggle-btn is-active" data-period="monthly">Monthly</button>
+        <button class="flow-toggle-btn" data-period="annual">Annual</button>
+      </div>
+    </div>
+
+    <div class="flow-figure">
+      <span id="flow-amount" class="flow-amount">$0</span>
+      <span class="flow-line" aria-hidden="true"><span class="flow-line-head">▶</span></span>
+    </div>
+    <p id="flow-substats" class="flow-substats"></p>
+
+    <div id="flow-streams" class="flow-streams" aria-hidden="true"></div>
+  </section>
+
+  <!-- Upcoming charges -->
+  <section id="upcoming-section" class="panel" hidden>
+    <div class="panel-head">
+      <h2 class="panel-title">Upcoming <span class="panel-sub">next 30 days</span></h2>
+      <span id="upcoming-total" class="panel-total"></span>
+    </div>
+    <ul id="upcoming-list" class="upcoming-list"></ul>
+  </section>
+
+  <!-- All streams -->
+  <section id="streams-section" class="panel" hidden>
+    <div class="panel-head">
+      <h2 class="panel-title">Your streams</h2>
+      <button id="btn-add" class="btn btn-primary btn-sm">+ Add stream</button>
+    </div>
+    <div id="status-filters" class="chips">
+      <button class="chip is-active" data-status="all">All</button>
+      <button class="chip" data-status="active">Active</button>
+      <button class="chip" data-status="trial">Trials</button>
+      <button class="chip" data-status="paused">Paused</button>
+      <button class="chip" data-status="cancelled">Cancelled</button>
+    </div>
+    <div id="streams-list" class="streams-list"></div>
+  </section>
+
+  <!-- Empty state -->
+  <section id="empty-state" class="empty" hidden>
+    <div class="empty-mark" aria-hidden="true">≈</div>
+    <h2 class="empty-title">No streams yet</h2>
+    <p class="empty-text">Add your first subscription to see where your money flows each month.</p>
+    <button id="btn-add-empty" class="btn btn-primary">Add your first stream</button>
+  </section>
+
+</main>
+
+<!-- ── Account setup modal (filled by auth.js) ─────────────────── -->
+<div class="modal-overlay" id="modal-account-setup" role="dialog" aria-modal="true"
+     aria-labelledby="account-setup-title">
+  <div class="modal modal-sm">
+    <div class="modal-header">
+      <h2 class="modal-title" id="account-setup-title"></h2>
+    </div>
+    <div class="modal-body" id="account-setup-body"></div>
+  </div>
+</div>
+
+<!-- ── Add / edit stream modal ─────────────────────────────────── -->
+<div class="modal-overlay" id="modal-sub" role="dialog" aria-modal="true" aria-labelledby="sub-modal-title">
+  <div class="modal">
+    <div class="modal-header">
+      <h2 class="modal-title" id="sub-modal-title">Add stream</h2>
+      <button class="icon-btn modal-close" data-close="modal-sub" aria-label="Close">✕</button>
+    </div>
+    <div class="modal-body">
+      <div class="form-group">
+        <label class="form-label" for="sub-name">Name</label>
+        <input class="input" id="sub-name" placeholder="Netflix, Adobe, gym…"/>
+      </div>
+
+      <div class="form-row">
+        <div class="form-group">
+          <label class="form-label" for="sub-amount">Amount</label>
+          <input class="input input-mono" id="sub-amount" inputmode="decimal" placeholder="0.00"/>
+        </div>
+        <div class="form-group" style="max-width:7rem;">
+          <label class="form-label" for="sub-currency">Currency</label>
+          <select class="input" id="sub-currency"></select>
+        </div>
+        <div class="form-group">
+          <label class="form-label" for="sub-frequency">Billing</label>
+          <select class="input" id="sub-frequency"></select>
+        </div>
+      </div>
+
+      <div class="form-row">
+        <div class="form-group">
+          <label class="form-label" for="sub-category">Category</label>
+          <select class="input" id="sub-category"></select>
+        </div>
+        <div class="form-group">
+          <label class="form-label" for="sub-next-date">Next charge</label>
+          <input class="input" id="sub-next-date" type="date"/>
+        </div>
+        <div class="form-group">
+          <label class="form-label" for="sub-status">Status</label>
+          <select class="input" id="sub-status"></select>
+        </div>
+      </div>
+
+      <div class="form-row">
+        <div class="form-group">
+          <label class="form-label" for="sub-payment">Payment method <span class="muted">(optional)</span></label>
+          <input class="input" id="sub-payment" placeholder="Visa ••4421"/>
+        </div>
+        <div class="form-group">
+          <label class="form-label" for="sub-lastused">Last used <span class="muted">(optional)</span></label>
+          <input class="input" id="sub-lastused" type="date"/>
+        </div>
+      </div>
+
+      <div class="form-group">
+        <label class="form-check">
+          <input type="checkbox" id="sub-autorenew" checked/>
+          <span>Renews automatically</span>
+        </label>
+      </div>
+
+      <div class="form-group">
+        <label class="form-label" for="sub-notes">Notes <span class="muted">(optional)</span></label>
+        <textarea class="input" id="sub-notes" rows="2" placeholder="Keep until October… cancellation is a nightmare…"></textarea>
+      </div>
+
+      <div id="sub-status-msg" class="form-msg"></div>
+
+      <div class="modal-actions">
+        <button class="btn btn-ghost btn-sm modal-close" data-close="modal-sub">Cancel</button>
+        <div class="modal-actions-right">
+          <button class="btn btn-danger-ghost btn-sm" id="sub-delete" style="display:none;">Delete</button>
+          <button class="btn btn-primary" id="sub-save">Save stream</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ── Settings modal ──────────────────────────────────────────── -->
+<div class="modal-overlay" id="modal-settings" role="dialog" aria-modal="true" aria-labelledby="settings-title">
+  <div class="modal">
+    <div class="modal-header">
+      <h2 class="modal-title" id="settings-title">Settings</h2>
+      <button class="icon-btn modal-close" data-close="modal-settings" aria-label="Close">✕</button>
+    </div>
+    <div class="modal-body">
+
+      <!-- Preferences -->
+      <div class="settings-section">
+        <div class="settings-section-header">Preferences</div>
+        <div class="settings-section-body">
+          <div class="form-row">
+            <div class="form-group">
+              <label class="form-label" for="settings-currency">Default currency</label>
+              <select class="input" id="settings-currency"></select>
+            </div>
+            <div class="form-group">
+              <label class="form-label" for="settings-flowview">Flow shows</label>
+              <select class="input" id="settings-flowview">
+                <option value="monthly">Monthly</option>
+                <option value="annual">Annual</option>
+              </select>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Backup -->
+      <div class="settings-section">
+        <div class="settings-section-header">Backup</div>
+        <div class="settings-section-body">
+          <div class="settings-row">
+            <div>
+              <div class="settings-row-label">Export a copy</div>
+              <div class="settings-row-sub">Download everything as a .json file.</div>
+            </div>
+            <button class="btn btn-outline btn-sm" id="btn-export">Export</button>
+          </div>
+          <div class="settings-row">
+            <div>
+              <div class="settings-row-label">Import a backup</div>
+              <div class="settings-row-sub">Replace local data from a .json file.</div>
+            </div>
+            <label class="btn btn-outline btn-sm" for="import-file" style="cursor:pointer;">Import</label>
+            <input id="import-file" type="file" accept="application/json" hidden/>
+          </div>
+        </div>
+      </div>
+
+      <!-- Account — populated by Auth.renderSettingsSection() -->
+      <div class="settings-section">
+        <div class="settings-section-header">
+          Account&nbsp;
+          <span id="settings-auth-badge" class="auth-badge auth-badge-guest">Guest</span>
+        </div>
+        <div class="settings-section-body">
+
+          <div id="settings-guest-section">
+            <p class="muted f13 lh">You're using Rivulet as a guest — everything is stored on this
+              device only. Create a free account to sync your streams across devices and keep a cloud backup.</p>
+            <button class="btn btn-primary btn-sm mt-8" id="settings-create-account">Create an account</button>
+          </div>
+
+          <div id="settings-token-group" style="display:none;">
+            <div class="settings-row" style="align-items:flex-start;gap:.75rem;">
+              <div style="min-width:0;flex:1;">
+                <div class="settings-row-label">Sync token</div>
+                <div class="settings-row-sub" style="margin-bottom:.4rem;">Copy this to sign in on another device.</div>
+                <div style="display:flex;align-items:center;gap:.4rem;">
+                  <code id="settings-token-display" class="token-display" title="Click to select">—</code>
+                  <button class="btn btn-sm btn-outline" id="settings-token-copy">Copy</button>
+                </div>
+              </div>
+            </div>
+            <div class="settings-row" style="margin-top:.5rem;">
+              <div>
+                <div class="settings-row-label">Use existing token</div>
+                <div class="settings-row-sub">Sign in with a token from another device.</div>
+              </div>
+              <button class="btn btn-sm btn-outline" id="settings-token-change">Enter token</button>
+            </div>
+          </div>
+
+          <div id="settings-google-info" style="display:none;"></div>
+
+          <div id="settings-worker-group" style="display:none;">
+            <div class="form-group" style="margin:0;">
+              <label class="form-label">Worker URL</label>
+              <input class="input" id="settings-worker-url" placeholder="https://your-worker.workers.dev"/>
+              <div class="form-hint">Your Cloudflare Worker endpoint for syncing.</div>
+            </div>
+          </div>
+
+          <div id="settings-sync-controls" style="display:none;">
+            <div class="settings-row">
+              <span class="settings-row-label">Sync now</span>
+              <button class="btn btn-outline btn-sm" id="settings-sync-now-btn">Sync</button>
+            </div>
+            <div class="settings-row">
+              <span class="settings-row-label">Last synced</span>
+              <span class="settings-row-sub" id="settings-last-synced">Never</span>
+            </div>
+          </div>
+
+          <div id="settings-upgrade-google" style="display:none;">
+            <button class="btn btn-ghost btn-sm" id="settings-upgrade-google-btn">Upgrade to Google sign-in →</button>
+          </div>
+
+          <div style="margin-top:.25rem;">
+            <button class="btn btn-ghost btn-sm" id="settings-account-btn">Switch account</button>
+          </div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+</div>
+
+<div id="toast-container" class="toast-container" aria-live="polite"></div>
+
+<script src="auth.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
