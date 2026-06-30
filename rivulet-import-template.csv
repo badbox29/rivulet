@@ -1,3 +1,3 @@
 name,amount,currency,frequency,category,nextChargeDate,status,paymentLabel,lastUsedDate,noticeDays,taxIncluded,autoRenews,emailAlert,notes
-Netflix,15.49,USD,monthly,Entertainment,2026-07-15,active,Visa ••4421,2026-06-22,0,yes,yes,no,Standard plan
-Adobe Creative Cloud,59.99,USD,monthly,Development,2026-07-02,active,Amex,,30,yes,yes,yes,30-day cancellation notice required
+Netflix,15.49,USD,monthly,Entertainment,7/15/2026,active,Visa x4462,6/22/2026,0,yes,yes,no,Standard plan
+Adobe Creative Cloud,59.99,USD,monthly,Development,7/2/2026,active,Amex x11531,,30,yes,yes,yes,30-day cancellation notice required
