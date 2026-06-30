@@ -487,8 +487,8 @@ function csvCell(v) {
 
 function csvTemplate() {
   const examples = [
-    ['Netflix', '15.49', 'USD', 'monthly', 'Entertainment', '2026-07-15', 'active', 'Visa ••4421', '2026-06-22', '0', 'yes', 'yes', 'no', 'Standard plan'],
-    ['Adobe Creative Cloud', '59.99', 'USD', 'monthly', 'Development', '2026-07-02', 'active', 'Amex', '', '30', 'yes', 'yes', 'yes', '30-day cancellation notice required'],
+    ['Netflix', '15.49', 'USD', 'monthly', 'Entertainment', '2026-07-15', 'active', 'Visa **4421', '2026-06-22', '0', 'yes', 'yes', 'no', 'Standard plan'],
+    ['Adobe Creative Cloud', '59.99', 'USD', 'monthly', 'Development', '2026-07-02', 'active', 'Amex **11521', '', '30', 'yes', 'yes', 'yes', '30-day cancellation notice required'],
   ];
   return [CSV_COLUMNS, ...examples].map(r => r.map(csvCell).join(',')).join('\r\n') + '\r\n';
 }
