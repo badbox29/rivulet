@@ -283,6 +283,21 @@
               </select>
             </div>
           </div>
+          <div class="form-row">
+            <div class="form-group">
+              <label class="form-label" for="settings-capacity-amount">Capacity (optional)</label>
+              <input class="input" id="settings-capacity-amount" type="number" min="0" step="1"
+                     inputmode="decimal" placeholder="e.g. 3000"/>
+              <div class="form-hint">A personal ceiling to measure flow against — not a budget. Leave blank to turn off.</div>
+            </div>
+            <div class="form-group">
+              <label class="form-label" for="settings-capacity-period">Capacity is</label>
+              <select class="input" id="settings-capacity-period">
+                <option value="monthly">Per month</option>
+                <option value="annual">Per year</option>
+              </select>
+            </div>
+          </div>
           <div class="settings-row">
             <div>
               <div class="settings-row-label">Browser reminders</div>
