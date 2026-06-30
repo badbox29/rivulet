@@ -31,6 +31,16 @@
   --reclaimed:#3E8E6F;   /* savings, reclaimed flow, "good" */
   --reclaimed-pale:#D8EAE2;
 
+  /* ── Themeable surfaces & tints (overridden under [data-theme="dark"]) ── */
+  --topbar-bg:  rgba(235,242,243,.85);  /* translucent top bar */
+  --solid:      #0A2630;   /* filled emphasis: active chip, badges (NOT ink) */
+  --on-solid:   #EAF4F5;   /* text/icon on --solid */
+  --tint-teal:  #E2F0F2;   /* pale teal badge backgrounds */
+  --tint-danger:#F6E4E2;   /* pale danger hover */
+  --focus-ring: rgba(21,120,138,.12);
+  --scrim:      rgba(10,38,48,.42);      /* modal overlay */
+  color-scheme: light;
+
   /* ── Auth module expects these (var(--x, fallback)) ── */
   --gold2:    var(--current);
   --green:    var(--reclaimed);
@@ -59,6 +69,57 @@
   --maxw: 880px;
 }
 
+/* ─────────────────────────────────────────────────────────────────
+   Dark theme — a deep-water palette. JS sets data-theme="dark" on <html>
+   (an inline <head> script applies it pre-paint to avoid a flash). Every
+   color is token-driven, so these overrides re-skin the whole app.
+   ───────────────────────────────────────────────────────────────── */
+:root[data-theme="dark"] {
+  /* Ink lightens; teals brighten a touch to hold contrast on dark */
+  --abyss:    #E6F1F2;
+  --deep:     #C2D6D9;
+  --current:  #3FB2C4;
+  --flow:     #4ECEDD;
+  --flow-pale:#2C6B77;
+
+  /* Surfaces — deep water; cards sit just above the background */
+  --surface:  #102A33;
+  --paper:    #0A1D24;
+  --paper-2:  #16323B;
+  --line:     #234851;
+
+  /* Text */
+  --muted:    #8BA3A8;
+  --faint:    #647C82;
+
+  /* Semantic warmth & growth — brightened; pales become dark tints */
+  --ember:    #E78A5E;
+  --ember-pale:#3A241B;
+  --danger:   #DD6055;
+  --reclaimed:#54B58E;
+  --reclaimed-pale:#1B3A30;
+
+  /* Themeable surfaces & tints */
+  --topbar-bg:  rgba(10,29,36,.82);
+  --solid:      #2A7682;   /* active chip reads as a teal pill on dark */
+  --on-solid:   #EAF6F7;
+  --tint-teal:  #16343C;
+  --tint-danger:#3A211E;
+  --focus-ring: rgba(78,206,221,.22);
+  --scrim:      rgba(0,0,0,.6);
+
+  /* Shadows — black-based, slightly stronger to register on dark */
+  --shadow:    0 1px 2px rgba(0,0,0,.4), 0 8px 24px rgba(0,0,0,.4);
+  --shadow-lg: 0 16px 50px rgba(0,0,0,.55);
+
+  color-scheme: dark;
+}
+
+/* Theme toggle glyph: moon in light mode, sun in dark mode. */
+#btn-theme .icon-sun { display: none; }
+:root[data-theme="dark"] #btn-theme .icon-moon { display: none; }
+:root[data-theme="dark"] #btn-theme .icon-sun  { display: block; }
+
 * { box-sizing: border-box; }
 
 html, body {
@@ -85,7 +146,7 @@ code { font-family: var(--font-mono); }
   position: sticky; top: 0; z-index: 50;
   display: flex; align-items: center; gap: 1rem;
   padding: .7rem clamp(1rem, 4vw, 2rem);
-  background: rgba(235,242,243,.85);
+  background: var(--topbar-bg);
   backdrop-filter: blur(10px);
   border-bottom: 1px solid var(--line);
 }
@@ -105,7 +166,7 @@ code { font-family: var(--font-mono); }
   background: var(--surface); border: 1px solid var(--line);
   border-radius: 999px; font: inherit; font-size: .9rem; color: var(--deep);
 }
-.search-input:focus { outline: none; border-color: var(--current); box-shadow: 0 0 0 3px rgba(21,120,138,.12); }
+.search-input:focus { outline: none; border-color: var(--current); box-shadow: 0 0 0 3px var(--focus-ring); }
 .topbar-actions { display: flex; align-items: center; gap: .6rem; margin-left: auto; }
 .sync-dot {
   width: 9px; height: 9px; border-radius: 50%;
@@ -291,7 +352,7 @@ code { font-family: var(--font-mono); }
   transition: background var(--motion-fast) ease, border-color var(--motion-fast) ease, color var(--motion-fast) ease;
 }
 .chip:hover { border-color: var(--current); color: var(--deep); }
-.chip.is-active { background: var(--abyss); border-color: var(--abyss); color: #EAF4F5; }
+.chip.is-active { background: var(--solid); border-color: var(--solid); color: var(--on-solid); }
 
 /* ── Streams list ────────────────────────────────────────────── */
 .streams-list { display: flex; flex-direction: column; }
@@ -314,7 +375,7 @@ code { font-family: var(--font-mono); }
 
 /* status + leak pills */
 .pill { font-size: .68rem; font-weight: 600; padding: .1rem .45rem; border-radius: 999px; letter-spacing: .02em; }
-.pill-trial    { background: #E2F0F2; color: var(--current); }
+.pill-trial    { background: var(--tint-teal); color: var(--current); }
 .pill-paused   { background: var(--paper-2); color: var(--muted); }
 .pill-cancelled{ background: var(--paper-2); color: var(--faint); text-decoration: line-through; }
 .pill-leak     { background: var(--ember-pale); color: var(--ember); }
@@ -341,7 +402,7 @@ code { font-family: var(--font-mono); }
 .btn-ghost { background: transparent; color: var(--muted); }
 .btn-ghost:hover { background: var(--paper-2); color: var(--deep); }
 .btn-danger-ghost { background: transparent; color: var(--danger); border-color: transparent; }
-.btn-danger-ghost:hover { background: #F6E4E2; }
+.btn-danger-ghost:hover { background: var(--tint-danger); }
 .w100 { width: 100%; }
 
 /* ── Forms ───────────────────────────────────────────────────── */
@@ -355,7 +416,7 @@ code { font-family: var(--font-mono); }
   width: 100%; padding: .55rem .7rem; font: inherit; font-size: .9rem; color: var(--deep);
   background: var(--surface); border: 1px solid var(--line); border-radius: var(--r-sm);
 }
-.input:focus { outline: none; border-color: var(--current); box-shadow: 0 0 0 3px rgba(21,120,138,.12); }
+.input:focus { outline: none; border-color: var(--current); box-shadow: 0 0 0 3px var(--focus-ring); }
 textarea.input { resize: vertical; line-height: 1.5; }
 .input-mono { font-family: var(--font-mono); }
 select.input { appearance: none; background-image: linear-gradient(45deg, transparent 50%, var(--muted) 50%), linear-gradient(135deg, var(--muted) 50%, transparent 50%); background-position: calc(100% - 16px) 52%, calc(100% - 11px) 52%; background-size: 5px 5px; background-repeat: no-repeat; padding-right: 1.8rem; }
@@ -366,7 +427,7 @@ select.input { appearance: none; background-image: linear-gradient(45deg, transp
 /* ── Modals ──────────────────────────────────────────────────── */
 .modal-overlay {
   position: fixed; inset: 0; z-index: 100;
-  background: rgba(10,38,48,.42); backdrop-filter: blur(2px);
+  background: var(--scrim); backdrop-filter: blur(2px);
   display: none; align-items: flex-start; justify-content: center;
   padding: clamp(1rem, 6vh, 4rem) 1rem;
   overflow-y: auto;
@@ -400,7 +461,7 @@ select.input { appearance: none; background-image: linear-gradient(45deg, transp
 .auth-divider span { padding: 0 .6rem; }
 .auth-badge { display: inline-block; padding: .15rem .55rem; border-radius: 999px; font-size: .72rem; font-weight: 600; vertical-align: middle; }
 .auth-badge-guest  { background: var(--paper-2); color: var(--muted); }
-.auth-badge-token  { background: #E2F0F2; color: var(--current); }
+.auth-badge-token  { background: var(--tint-teal); color: var(--current); }
 .auth-badge-google { background: var(--reclaimed-pale); color: var(--reclaimed); }
 .auth-google-info { display: flex; align-items: center; gap: .6rem; }
 .auth-google-avatar { width: 36px; height: 36px; border-radius: 50%; object-fit: cover; flex: none; }
@@ -409,7 +470,7 @@ select.input { appearance: none; background-image: linear-gradient(45deg, transp
 /* ── Toasts ──────────────────────────────────────────────────── */
 .toast-container { position: fixed; bottom: 1.2rem; left: 50%; transform: translateX(-50%); z-index: 200; display: flex; flex-direction: column; gap: .5rem; align-items: center; pointer-events: none; }
 .toast {
-  background: var(--abyss); color: #EAF4F5; padding: .6rem 1rem; border-radius: var(--r-sm);
+  background: var(--solid); color: var(--on-solid); padding: .6rem 1rem; border-radius: var(--r-sm);
   font-size: .88rem; box-shadow: var(--shadow-lg);
   animation: toast-in .2s ease, toast-out .3s ease forwards 3.2s;
 }
