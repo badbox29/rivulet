@@ -91,9 +91,9 @@ code { font-family: var(--font-mono); }
 }
 .brand { display: flex; align-items: center; gap: .5rem; }
 .brand-mark {
-  font-size: 1.5rem; line-height: 1; color: var(--flow);
+  display: block;
+  height: 1.7rem; width: auto;
   transform: translateY(1px);
-  text-shadow: 0 0 0 var(--current);
 }
 .brand-name {
   font-family: var(--font-display); font-weight: 800; font-size: 1.25rem;
