@@ -146,7 +146,11 @@ code { font-family: var(--font-mono); }
   font-family: var(--font-display); font-weight: 800;
   font-size: clamp(2.8rem, 9vw, 4.5rem); line-height: 1;
   color: var(--abyss); font-variant-numeric: tabular-nums; letter-spacing: -.03em;
+  transition: color .4s ease;
 }
+/* Capacity bands — neutral under 75%, warm approaching, red over. */
+.flow-amount.cap-near { color: var(--ember); }
+.flow-amount.cap-over { color: var(--danger); }
 .flow-line {
   position: relative; flex: 1; height: 6px; margin-bottom: .6rem; margin-left: .4rem;
   background: linear-gradient(90deg, var(--current), var(--flow) 70%, rgba(47,180,196,.15));
@@ -156,6 +160,9 @@ code { font-family: var(--font-mono); }
 .flow-substats { margin: .7rem 0 0; color: var(--muted); font-size: .92rem; }
 .flow-substats b { color: var(--deep); font-weight: 600; font-variant-numeric: tabular-nums; }
 .flow-substats .leak-stat { color: var(--ember); font-weight: 600; }
+.flow-substats .cap-stat { color: var(--muted); }
+.flow-substats .cap-stat.cap-stat-near { color: var(--ember); }
+.flow-substats .cap-stat.cap-stat-over { color: var(--danger); }
 
 /* Stream bars — width is cost; gradient drains rightward */
 .flow-streams { margin-top: 1.3rem; display: flex; flex-direction: column; gap: .5rem; }
@@ -470,4 +477,5 @@ select.input { appearance: none; background-image: linear-gradient(45deg, transp
   .modal, .toast { animation: none; }
   .riv-enter, .anim-swap, .stream-bar-fill { animation: none; }
   .chip, .stream-row { transition: none; }
+  .flow-amount { transition: none; }
 }
