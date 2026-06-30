@@ -68,7 +68,7 @@ function defaultData() {
     subscriptions:  [],
     paymentMethods: [],
     settings: { currency: 'USD', flowView: 'monthly', reminderLeads: [7, 1], notifyBrowser: false,
-                capacityAmount: 0, capacityPeriod: 'monthly' },
+                capacityAmount: 0, capacityPeriod: 'monthly', theme: 'light' },
     dismissedReminders: {},   // reminderId → date dismissed (re-surfaces next cycle)
     lastNotifyDate: '',       // YYYY-MM-DD of the last browser notification (once/day)
     lastSyncTime: 0, pendingSync: false, lastModified: Date.now(),
@@ -88,7 +88,8 @@ function mergeData(raw) {
       ? { ...d.settings, ...raw.settings,
           reminderLeads: Array.isArray(raw.settings.reminderLeads) ? raw.settings.reminderLeads : d.settings.reminderLeads,
           capacityAmount: (Number.isFinite(+raw.settings.capacityAmount) && +raw.settings.capacityAmount > 0) ? +raw.settings.capacityAmount : 0,
-          capacityPeriod: raw.settings.capacityPeriod === 'annual' ? 'annual' : 'monthly' }
+          capacityPeriod: raw.settings.capacityPeriod === 'annual' ? 'annual' : 'monthly',
+          theme: raw.settings.theme === 'dark' ? 'dark' : 'light' }
       : d.settings,
   };
 }
@@ -691,7 +692,30 @@ function applyTemplate(i) {
 }
 
 // ─── Rendering ────────────────────────────────────────────────────
+// ─── Theme ────────────────────────────────────────────────────────
+// Light/dark only. The choice lives in settings.theme; applying it just
+// toggles data-theme on <html> and every color (token-driven) follows.
+// An inline <head> script sets it pre-paint to avoid a flash; this keeps
+// the attribute and the toggle's label in sync on each render.
+function applyTheme() {
+  const dark = App.data?.settings?.theme === 'dark';
+  document.documentElement.setAttribute('data-theme', dark ? 'dark' : 'light');
+  const btn = $('#btn-theme');
+  if (btn) {
+    const label = dark ? 'Switch to light mode' : 'Switch to dark mode';
+    btn.title = label;
+    btn.setAttribute('aria-label', label);
+  }
+}
+
+function toggleTheme() {
+  App.data.settings.theme = App.data.settings.theme === 'dark' ? 'light' : 'dark';
+  applyTheme();
+  markDirty();
+}
+
 function renderApp() {
+  applyTheme();
   const subs = App.data.subscriptions;
   const has = subs.length > 0;
 
@@ -1329,6 +1353,7 @@ async function importBackup(file) {
 // ─── Event wiring ─────────────────────────────────────────────────
 function wireEvents() {
   $('#btn-settings').addEventListener('click', openSettings);
+  $('#btn-theme').addEventListener('click', toggleTheme);
   $('#btn-reminders').addEventListener('click', openReminders);
   $('#btn-import').addEventListener('click', openImport);
   $('#btn-add').addEventListener('click', () => openSubModal());
