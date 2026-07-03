@@ -793,7 +793,12 @@ function renderHero() {
 
   const cat = App.heroView === 'category' ? App.categoryFilter : null;
   const baseMonthly = cat ? categoryMonthly(cat) : activeMonthlyTotal();
-  const shown = annual ? baseMonthly * 12 : baseMonthly;
+  // Monthly = current run-rate (what's active now). Annual = actual charges in
+  // the next 12 months, so finite payment plans stop contributing once their
+  // remaining payments run out rather than being counted a full year.
+  const shown = annual
+    ? annualFlow(cat ? s => s.category === cat : null)
+    : baseMonthly;
   animateNumber($('#flow-amount'), shown, formatMoney);
 
   // Capacity color cue — only on the global flow figure. When a category is
@@ -829,7 +834,11 @@ function globalSubstats(annual) {
   const reclaim = leakMonthly();
   const increases = subs.filter(s => recentIncrease(s, 90)).length;
   const plans = activeInstallments().length;
-  const other = annual ? `${formatMoney(monthlyTotal)}/mo` : `${formatMoney(monthlyTotal * 12)}/year`;
+  // Mirror figure: in annual view show the monthly run-rate; in monthly view
+  // show the finite-aware annual (charges landing in the next 12 months).
+  const other = annual
+    ? `${formatMoney(monthlyTotal)}/mo`
+    : `${formatMoney(annualFlow())}/year`;
 
   const bits = [
     `<b>${other.split('/')[0]}</b>/${other.split('/')[1]}`,
@@ -1156,6 +1165,33 @@ function projectSpend(months) {
   const cumulative = []; let run = 0;
   for (let i = 0; i < months; i++) { run += buckets[i]; cumulative.push(run); }
   return { months, buckets, cumulative, total: run, start, disp };
+}
+
+// Annual "if nothing changes" flow, optionally scoped by a stream predicate.
+//
+// Perpetual streams contribute their monthly run-rate × 12 — the clean,
+// calendar-independent projection (a monthly stream is 12 payments a year
+// regardless of which day its charge lands on). Finite payment plans instead
+// contribute only the charges that actually fall within the next 12 months,
+// so a plan with 3 payments left adds 3× its amount, and a long plan is capped
+// at the ~12 charges that fit in the window — nothing past 12 months counts.
+function annualFlow(filterFn) {
+  const start = startOfToday();
+  const end = new Date(start); end.setMonth(end.getMonth() + 12);
+  const disp = displayCurrency();
+  let total = 0;
+  for (const s of App.data.subscriptions) {
+    if (!isActive(s)) continue;
+    if (filterFn && !filterFn(s)) continue;
+    if (isFinitePlan(s)) {
+      const amt = convertAmount(Number(s.amount) || 0, s.currency, disp);
+      if (amt <= 0) continue;
+      for (const _d of chargeDatesWithin(s, start, end)) total += amt;   // capped at final payment
+    } else {
+      total += normMonthly(s) * 12;   // perpetual: clean run-rate projection
+    }
+  }
+  return total;
 }
 
 function niceCeil(v) {
