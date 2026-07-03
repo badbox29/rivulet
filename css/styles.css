@@ -344,6 +344,24 @@ code { font-family: var(--font-mono); }
 .upcoming-when.soon { color: var(--ember); }
 .upcoming-amt { font-family: var(--font-mono); font-size: .88rem; color: var(--deep); font-variant-numeric: tabular-nums; }
 
+/* Installments (finite payment plans) */
+.installments-relief { font-size: .85rem; color: var(--muted); margin: 0 0 .8rem; }
+.installments-relief b { color: var(--reclaimed); font-weight: 700; }
+.installments-list { list-style: none; margin: 0; padding: 0; }
+.installment-row {
+  display: grid; grid-template-columns: 1fr auto; align-items: center; gap: .3rem 1rem;
+  padding: .7rem .2rem; border-top: 1px solid var(--line); cursor: pointer;
+}
+.installment-row:first-child { border-top: 0; }
+.installment-row:hover { background: var(--paper-2); border-radius: var(--r-sm); }
+.installment-main { display: flex; flex-direction: column; gap: .2rem; min-width: 0; }
+.installment-name { font-weight: 600; color: var(--abyss); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.installment-meta { font-size: .76rem; color: var(--muted); }
+.installment-right { display: flex; flex-direction: column; align-items: flex-end; gap: .2rem; }
+.installment-amt { font-family: var(--font-mono); font-weight: 500; color: var(--deep); font-variant-numeric: tabular-nums; }
+.installment-amt .per { color: var(--faint); font-size: .72rem; }
+.installment-owed { font-family: var(--font-mono); font-size: .76rem; color: var(--current); font-variant-numeric: tabular-nums; }
+
 /* ── Chips / filters ─────────────────────────────────────────── */
 .chips { display: flex; flex-wrap: wrap; gap: .4rem; margin-bottom: 1rem; }
 .chip {
