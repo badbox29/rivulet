@@ -3,7 +3,7 @@
 A personal subscription tracker built around the idea that recurring spending is a set of streams draining away each month — not a budget to police, but a map of commitments to see clearly. Track subscriptions, utilities, and finite payment plans; watch your flow rendered as living bars that widen with cost; set an optional capacity ceiling; and project the exact amount leaving your account over the next twelve months. No build tools, no npm, no dependencies — just static files and a Cloudflare Worker backend for authentication and cross-device sync.
 
 #### Demo:
-https://badbox29.github.io/rivulet
+https://your-username.github.io/rivulet
 
 ---
 
@@ -92,15 +92,25 @@ A free Cloudflare account is sufficient for personal use. The $5/month Workers P
 
 > **Why `RIVULET_KV`?** The worker references `env.RIVULET_KV` by that exact name. A different variable name will break every storage and auth route.
 
-#### 2c. Set environment variables (Google sign-in only)
+#### 2c. Set environment variables
 
-Token-based sync and guest mode need no configuration at all. If you want the Google account tier, add one variable in your Worker → **Settings → Variables and Secrets**:
+In your Worker → **Settings → Variables and Secrets**, add the following:
 
 | Variable | Type | Value |
 |---|---|---|
-| `GOOGLE_CLIENT_ID` | Text | Your Google OAuth Client ID |
+| `ALLOWED_ORIGINS` | Text | Comma-separated list of origins allowed to use the Worker (see below) |
+| `GOOGLE_CLIENT_ID` | Text | Your Google OAuth Client ID (only if you want Google sign-in) |
 
-Leave it unset to disable Google sign-in. No client secret is required — the Worker verifies Google ID tokens against Google's published public keys, so there is no code-exchange flow and no secret to store.
+**`ALLOWED_ORIGINS` example:**
+```
+https://your-username.github.io,http://localhost:3000
+```
+
+Include every URL from which you'll access the app. This is more than a CORS header: unlisted browser origins are **rejected outright** before any storage or auth handler runs, so the Worker won't act as a backend for sites you didn't authorize.
+
+> **Fail-closed by design.** If `ALLOWED_ORIGINS` is unset or empty, every data and auth route is blocked until you configure it — a missing config fails loudly rather than silently leaving the Worker wide open. The health check (`GET /`) stays reachable so you can still confirm the Worker is alive. Note that the origin check is browser-enforced (it stops other websites and casual cross-site abuse); the real protection on your data remains the per-request HMAC signing and Google ID-token verification.
+
+Google sign-in is optional. No client secret is required — the Worker verifies Google ID tokens against Google's published public keys, so there is no code-exchange flow and no secret to store. Leave `GOOGLE_CLIENT_ID` unset to disable Google sign-in.
 
 > **Note:** The Google Client ID is never embedded in the app source. The frontend fetches it at runtime from the Worker's `GET /auth/config`. Token-only and guest accounts don't need it at all.
 
@@ -154,7 +164,7 @@ Legacy tokens generated before the current scheme are detected at boot and offer
 | `GET` | `/storage/:key/profile` | Read the app-data blob (410 / `X-Token-Migrated` on a migrated token) |
 | `PUT` | `/storage/:key/profile` | Write the app-data blob (HMAC signed for token accounts) |
 
-Token-account storage requests carry `X-Timestamp` and `X-Signature` headers (HMAC over the token, derived via HKDF); Google-account requests carry a `Bearer` ID token. Both are verified server-side on every call.
+Every route except the health check is gated by `ALLOWED_ORIGINS`: a browser request from an unlisted origin is rejected with `403` before reaching any handler. Past the gate, token-account storage requests carry `X-Timestamp` and `X-Signature` headers (HMAC over the token, derived via HKDF); Google-account requests carry a `Bearer` ID token. Both are verified server-side on every call.
 
 ---
 
