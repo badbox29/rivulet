@@ -171,18 +171,32 @@ function activeMonthlyTotal() {
 
 // ─── Capacity ─────────────────────────────────────────────────────
 // An optional personal ceiling (NOT a budget). The amount is held in the
-// display currency; we normalize it to a monthly figure so the ratio is
-// the same whether the hero shows monthly or annual.
+// display currency. Capacity is evaluated in whichever window the hero is
+// showing: monthly view compares this month's run-rate against the monthly
+// ceiling; annual view compares the real next-12-months spend (finite plans
+// capped, via annualFlow) against the annual ceiling. This keeps capacity
+// consistent with the flow figure the user is looking at.
 function capacityMonthly() {
   const amt = +App.data.settings.capacityAmount || 0;
   if (amt <= 0) return 0;
   return App.data.settings.capacityPeriod === 'annual' ? amt / 12 : amt;
 }
+function capacityAnnual() {
+  const amt = +App.data.settings.capacityAmount || 0;
+  if (amt <= 0) return 0;
+  return App.data.settings.capacityPeriod === 'annual' ? amt : amt * 12;
+}
+// Spend and ceiling for the given window ('monthly' | 'annual'), in display
+// currency. Annual uses the finite-aware projection so it equals the hero.
+function capacitySpend(annual) { return annual ? annualFlow() : activeMonthlyTotal(); }
+function capacityCeiling(annual) { return annual ? capacityAnnual() : capacityMonthly(); }
 // Total active flow as a fraction of capacity (0..∞), or null when unset.
-function capacityRatio() {
-  const cap = capacityMonthly();
+// Defaults to the monthly window for callers that don't specify (e.g. the
+// flow-figure color cue, which is period-agnostic).
+function capacityRatio(annual = false) {
+  const cap = capacityCeiling(annual);
   if (cap <= 0) return null;
-  return activeMonthlyTotal() / cap;
+  return capacitySpend(annual) / cap;
 }
 // Band for a ratio: 'ok' (<75%) | 'near' (75–100%) | 'over' (>100%); null if unset.
 function capacityBand(ratio = capacityRatio()) {
@@ -803,10 +817,11 @@ function renderHero() {
 
   // Capacity color cue — only on the global flow figure. When a category is
   // selected the number is that category's total, so the overall ceiling
-  // doesn't apply.
+  // doesn't apply. The band follows the shown window: annual view judges the
+  // real 12-month spend against the annual ceiling.
   const flowEl = $('#flow-amount');
   flowEl.classList.remove('cap-ok', 'cap-near', 'cap-over');
-  const band = cat ? null : capacityBand();
+  const band = cat ? null : capacityBand(capacityRatio(annual));
   if (band) flowEl.classList.add('cap-' + band);
 
   // Eyebrow names the current scope so the big number is never ambiguous.
@@ -845,11 +860,10 @@ function globalSubstats(annual) {
     `<b>${activeCount}</b> active ${activeCount === 1 ? 'stream' : 'streams'}`,
   ];
   if (plans) bits.push(`<span class="plan-stat"><b>${plans}</b> payment ${plans === 1 ? 'plan' : 'plans'}</span>`);
-  const ratio = capacityRatio();
+  const ratio = capacityRatio(annual);
   if (ratio != null) {
     const pct  = Math.round(ratio * 100);
-    const gapM = activeMonthlyTotal() - capacityMonthly();       // monthly $ over/under
-    const gap  = formatMoney(Math.abs(annual ? gapM * 12 : gapM));
+    const gap  = formatMoney(Math.abs(capacitySpend(annual) - capacityCeiling(annual)));
     const band = capacityBand(ratio);                            // ok | near | over
     const tail = ratio > 1 ? `${gap} over` : `${gap} left`;
     bits.push(`<span class="cap-stat cap-stat-${band}"><b>${pct}%</b> of capacity · ${tail}</span>`);
