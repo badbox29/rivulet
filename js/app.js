@@ -1181,17 +1181,36 @@ function projectSpend(months) {
   return { months, buckets, cumulative, total: run, start, disp };
 }
 
+// Count how many of a finite plan's remaining payments fall on or before the
+// given cutoff date. These are known, finite obligations, so the boundary is
+// INCLUSIVE — a payment landing exactly on the 12-month anniversary is still a
+// payment you'll make this year. Capped at remainingPayments (never counts past
+// the plan's end) and at the window (never counts beyond the cutoff).
+function finitePaymentsBy(sub, cutoff) {
+  if (!isFinitePlan(sub)) return 0;
+  let d = parseDate(sub.nextChargeDate);
+  if (!d) return 0;
+  let count = 0, guard = 0;
+  for (let i = 0; i < sub.remainingPayments && guard++ < 3000; i++) {
+    if (d <= cutoff) count++;      // inclusive: on-or-before the cutoff counts
+    else break;                    // dates only move forward; once past, done
+    d = stepDate(d, sub.frequency);
+  }
+  return count;
+}
+
 // Annual "if nothing changes" flow, optionally scoped by a stream predicate.
 //
 // Perpetual streams contribute their monthly run-rate × 12 — the clean,
 // calendar-independent projection (a monthly stream is 12 payments a year
-// regardless of which day its charge lands on). Finite payment plans instead
-// contribute only the charges that actually fall within the next 12 months,
-// so a plan with 3 payments left adds 3× its amount, and a long plan is capped
-// at the ~12 charges that fit in the window — nothing past 12 months counts.
+// regardless of which day its charge lands on). Finite payment plans contribute
+// only the remaining payments that fall within the next 12 months (inclusive of
+// the anniversary date): a plan with 3 payments left adds 3× its amount, a
+// 12-payment plan adds its full 12, and a longer plan is capped at the payments
+// that fit in the year — nothing past 12 months counts.
 function annualFlow(filterFn) {
   const start = startOfToday();
-  const end = new Date(start); end.setMonth(end.getMonth() + 12);
+  const cutoff = new Date(start); cutoff.setMonth(cutoff.getMonth() + 12);
   const disp = displayCurrency();
   let total = 0;
   for (const s of App.data.subscriptions) {
@@ -1200,7 +1219,7 @@ function annualFlow(filterFn) {
     if (isFinitePlan(s)) {
       const amt = convertAmount(Number(s.amount) || 0, s.currency, disp);
       if (amt <= 0) continue;
-      for (const _d of chargeDatesWithin(s, start, end)) total += amt;   // capped at final payment
+      total += amt * finitePaymentsBy(s, cutoff);   // remaining payments within the year
     } else {
       total += normMonthly(s) * 12;   // perpetual: clean run-rate projection
     }
