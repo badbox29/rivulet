@@ -836,7 +836,7 @@ function renderHero() {
   if (clearBtn) clearBtn.style.display = cat ? '' : 'none';
 
   if (App.heroView === 'category') renderCategoryBars(annual);
-  else renderStreamBars();
+  else renderStreamBars(annual);
 }
 
 function globalSubstats(annual) {
@@ -893,31 +893,35 @@ function categorySubstats(cat, annual) {
 // True for an active finite installment plan (has payments remaining).
 function isFinitePlan(s) { return !!(s.isFinite && s.remainingPayments >= 1); }
 
-// Per-stream bars — widest = costliest, draining rightward. Each bar renders
-// at its target width; the riv-fill keyframe sweeps it in from 0 on creation,
-// so this replays on every hero render. Disabled under reduced-motion in CSS.
-// Finite payment plans are flagged with a badge + tinted bar so they read as
-// temporary drains at a glance.
-function renderStreamBars() {
+// Per-stream bars — width is cost in the shown window (monthly run-rate or
+// 12-month total), widest = costliest, draining rightward. In annual view a
+// finite plan shows only its remaining payments' worth (capped at 12 months),
+// so a short plan reads smaller than its monthly bar would imply. The riv-fill
+// keyframe sweeps each bar in from 0 on creation, replaying on every render.
+// Finite payment plans are flagged with a badge + tinted bar at a glance.
+function renderStreamBars(annual) {
   const ranked = App.data.subscriptions.filter(isActive)
-    .map(s => ({ s, m: normMonthly(s) })).sort((a, b) => b.m - a.m).slice(0, 8);
-  const max = ranked.length ? ranked[0].m : 1;
-  $('#flow-streams').innerHTML = ranked.map(({ s, m }) => {
+    .map(s => ({ s, v: annual ? streamAnnual(s) : normMonthly(s) }))
+    .sort((a, b) => b.v - a.v).slice(0, 8);
+  const max = ranked.length ? ranked[0].v : 1;
+  $('#flow-streams').innerHTML = ranked.map(({ s, v }) => {
     const plan = isFinitePlan(s);
     const badge = plan ? `<span class="plan-badge" title="Payment plan — ${s.remainingPayments} left">plan</span>` : '';
     return `
     <div class="stream-bar-row${plan ? ' is-plan' : ''}">
       <span class="stream-bar-name">${badge}${esc(s.name || 'Untitled')}</span>
       <div class="stream-bar-track">
-        <div class="stream-bar-fill" style="width:${Math.max(6, (m / max) * 100).toFixed(2)}%;"></div>
+        <div class="stream-bar-fill" style="width:${Math.max(6, (v / max) * 100).toFixed(2)}%;"></div>
       </div>
-      <span class="stream-bar-amt">${formatMoney(m)}</span>
+      <span class="stream-bar-amt">${formatMoney(v)}</span>
     </div>`;
   }).join('');
 }
 
 // Per-category bars — each a tributary; click to scope the hero + filter the
-// list. Used categories only, top 10 by spend.
+// list. Used categories only, top 10 by spend. In annual view both the amount
+// and the bar width use the finite-aware 12-month total, so a category holding
+// a short payment plan shrinks appropriately.
 function renderCategoryBars(annual) {
   const cats = usedCategories().slice(0, 10);
   const container = $('#flow-streams');
@@ -925,15 +929,20 @@ function renderCategoryBars(annual) {
     container.innerHTML = `<p class="muted f13" style="padding:.4rem 0;">No active streams to break down yet.</p>`;
     return;
   }
-  const max = cats[0].total || 1;
-  container.innerHTML = cats.map(({ category, total }) => {
-    const amt = formatMoney(annual ? total * 12 : total);
+  // Value per category in the shown window; re-sort for annual since finite
+  // plans can change the ranking versus monthly run-rate.
+  const rows = cats
+    .map(({ category }) => ({ category, v: annual ? categoryAnnual(category) : categoryMonthly(category) }))
+    .sort((a, b) => b.v - a.v);
+  const max = rows.length ? (rows[0].v || 1) : 1;
+  container.innerHTML = rows.map(({ category, v }) => {
+    const amt = formatMoney(v);
     const sel = App.categoryFilter === category;
     return `
     <div class="stream-bar-row cat-bar-row ${sel ? 'is-selected' : ''}" data-cat="${esc(category)}" role="button" tabindex="0" aria-pressed="${sel}">
       <span class="stream-bar-name">${esc(category)}</span>
       <div class="stream-bar-track">
-        <div class="stream-bar-fill" style="width:${Math.max(6, (total / max) * 100).toFixed(2)}%;"></div>
+        <div class="stream-bar-fill" style="width:${Math.max(6, (v / max) * 100).toFixed(2)}%;"></div>
       </div>
       <span class="stream-bar-amt">${amt}</span>
     </div>`;
@@ -1199,32 +1208,43 @@ function finitePaymentsBy(sub, cutoff) {
   return count;
 }
 
+// A single active stream's cost over the next 12 months, in display currency.
+// Perpetual → monthly run-rate × 12. Finite → amount × the remaining payments
+// that fall within the next 12 months (capped at the plan's end and the window).
+// This is the single source of truth for annual per-stream cost; annualFlow,
+// the hero bars, and category annual totals all derive from it.
+function streamAnnual(s, cutoff = null) {
+  if (!cutoff) { cutoff = new Date(startOfToday()); cutoff.setMonth(cutoff.getMonth() + 12); }
+  const disp = displayCurrency();
+  if (isFinitePlan(s)) {
+    const amt = convertAmount(Number(s.amount) || 0, s.currency, disp);
+    return amt <= 0 ? 0 : amt * finitePaymentsBy(s, cutoff);
+  }
+  return normMonthly(s) * 12;   // perpetual: clean run-rate projection
+}
+
 // Annual "if nothing changes" flow, optionally scoped by a stream predicate.
-//
-// Perpetual streams contribute their monthly run-rate × 12 — the clean,
-// calendar-independent projection (a monthly stream is 12 payments a year
-// regardless of which day its charge lands on). Finite payment plans contribute
-// only the remaining payments that fall within the next 12 months (inclusive of
-// the anniversary date): a plan with 3 payments left adds 3× its amount, a
-// 12-payment plan adds its full 12, and a longer plan is capped at the payments
-// that fit in the year — nothing past 12 months counts.
+// Sums streamAnnual over active streams: perpetual streams contribute a full
+// 12 monthly-equivalents, finite plans only their payments left within the year
+// (a 3-payment plan adds 3× its amount; a long plan is capped at ~12).
 function annualFlow(filterFn) {
   const start = startOfToday();
   const cutoff = new Date(start); cutoff.setMonth(cutoff.getMonth() + 12);
-  const disp = displayCurrency();
   let total = 0;
   for (const s of App.data.subscriptions) {
     if (!isActive(s)) continue;
     if (filterFn && !filterFn(s)) continue;
-    if (isFinitePlan(s)) {
-      const amt = convertAmount(Number(s.amount) || 0, s.currency, disp);
-      if (amt <= 0) continue;
-      total += amt * finitePaymentsBy(s, cutoff);   // remaining payments within the year
-    } else {
-      total += normMonthly(s) * 12;   // perpetual: clean run-rate projection
-    }
+    total += streamAnnual(s, cutoff);
   }
   return total;
+}
+
+// One category's cost over the next 12 months (finite-aware), display currency.
+function categoryAnnual(cat) {
+  const cutoff = new Date(startOfToday()); cutoff.setMonth(cutoff.getMonth() + 12);
+  return App.data.subscriptions
+    .filter(s => isActive(s) && s.category === cat)
+    .reduce((sum, s) => sum + streamAnnual(s, cutoff), 0);
 }
 
 function niceCeil(v) {
