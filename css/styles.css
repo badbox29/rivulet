@@ -224,11 +224,22 @@ code { font-family: var(--font-mono); }
 .flow-substats .cap-stat { color: var(--muted); }
 .flow-substats .cap-stat.cap-stat-near { color: var(--ember); }
 .flow-substats .cap-stat.cap-stat-over { color: var(--danger); }
+.flow-substats .plan-stat { color: var(--reclaimed); font-weight: 600; }
 
 /* Stream bars — width is cost; gradient drains rightward */
 .flow-streams { margin-top: 1.3rem; display: flex; flex-direction: column; gap: .5rem; }
 .stream-bar-row { display: grid; grid-template-columns: 120px 1fr auto; align-items: center; gap: .75rem; }
 .stream-bar-name { font-size: .85rem; color: var(--deep); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.stream-bar-name .plan-badge {
+  display: inline-block; font-size: .58rem; font-weight: 700; letter-spacing: .04em;
+  text-transform: uppercase; color: var(--reclaimed); background: var(--reclaimed-pale, var(--tint-teal));
+  border: 1px solid var(--reclaimed); border-radius: 3px; padding: 0 .22rem; margin-right: .35rem;
+  vertical-align: middle; line-height: 1.35;
+}
+/* Finite plans drain in a distinct reclaimed-green so they read as temporary. */
+.stream-bar-row.is-plan .stream-bar-fill {
+  background: linear-gradient(90deg, var(--reclaimed), var(--reclaimed) 70%, rgba(122,184,148,.35));
+}
 .stream-bar-track { position: relative; height: 16px; }
 .stream-bar-fill {
   height: 100%; border-radius: 4px;
