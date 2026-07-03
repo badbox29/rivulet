@@ -828,12 +828,14 @@ function globalSubstats(annual) {
   const leaks = subs.filter(isLeak).length;
   const reclaim = leakMonthly();
   const increases = subs.filter(s => recentIncrease(s, 90)).length;
+  const plans = activeInstallments().length;
   const other = annual ? `${formatMoney(monthlyTotal)}/mo` : `${formatMoney(monthlyTotal * 12)}/year`;
 
   const bits = [
     `<b>${other.split('/')[0]}</b>/${other.split('/')[1]}`,
     `<b>${activeCount}</b> active ${activeCount === 1 ? 'stream' : 'streams'}`,
   ];
+  if (plans) bits.push(`<span class="plan-stat"><b>${plans}</b> payment ${plans === 1 ? 'plan' : 'plans'}</span>`);
   const ratio = capacityRatio();
   if (ratio != null) {
     const pct  = Math.round(ratio * 100);
@@ -865,21 +867,30 @@ function categorySubstats(cat, annual) {
   return bits.join(' · ');
 }
 
+// True for an active finite installment plan (has payments remaining).
+function isFinitePlan(s) { return !!(s.isFinite && s.remainingPayments >= 1); }
+
 // Per-stream bars — widest = costliest, draining rightward. Each bar renders
 // at its target width; the riv-fill keyframe sweeps it in from 0 on creation,
 // so this replays on every hero render. Disabled under reduced-motion in CSS.
+// Finite payment plans are flagged with a badge + tinted bar so they read as
+// temporary drains at a glance.
 function renderStreamBars() {
   const ranked = App.data.subscriptions.filter(isActive)
     .map(s => ({ s, m: normMonthly(s) })).sort((a, b) => b.m - a.m).slice(0, 8);
   const max = ranked.length ? ranked[0].m : 1;
-  $('#flow-streams').innerHTML = ranked.map(({ s, m }) => `
-    <div class="stream-bar-row">
-      <span class="stream-bar-name">${esc(s.name || 'Untitled')}</span>
+  $('#flow-streams').innerHTML = ranked.map(({ s, m }) => {
+    const plan = isFinitePlan(s);
+    const badge = plan ? `<span class="plan-badge" title="Payment plan — ${s.remainingPayments} left">plan</span>` : '';
+    return `
+    <div class="stream-bar-row${plan ? ' is-plan' : ''}">
+      <span class="stream-bar-name">${badge}${esc(s.name || 'Untitled')}</span>
       <div class="stream-bar-track">
         <div class="stream-bar-fill" style="width:${Math.max(6, (m / max) * 100).toFixed(2)}%;"></div>
       </div>
       <span class="stream-bar-amt">${formatMoney(m)}</span>
-    </div>`).join('');
+    </div>`;
+  }).join('');
 }
 
 // Per-category bars — each a tributary; click to scope the hero + filter the
