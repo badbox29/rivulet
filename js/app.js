@@ -28,10 +28,12 @@ const CATEGORIES = ['Automotive', 'Cloud', 'Communication', 'Development', 'Educ
   'Utilities', 'Other'];
 
 const FREQUENCIES = [
-  { id: 'weekly',    label: 'Weekly',    per: 'wk', toMonthly: a => a * 52 / 12 },
-  { id: 'monthly',   label: 'Monthly',   per: 'mo', toMonthly: a => a },
-  { id: 'quarterly', label: 'Quarterly', per: 'qt', toMonthly: a => a / 3 },
-  { id: 'yearly',    label: 'Yearly',    per: 'yr', toMonthly: a => a / 12 },
+  { id: 'weekly',      label: 'Weekly',         per: 'wk',  toMonthly: a => a * 52 / 12 },
+  { id: 'biweekly',   label: 'Every 2 weeks',   per: '2wk', toMonthly: a => a * 26 / 12 },
+  { id: 'fourweekly', label: 'Every 4 weeks',   per: '4wk', toMonthly: a => a * 13 / 12 },
+  { id: 'monthly',    label: 'Monthly',          per: 'mo',  toMonthly: a => a },
+  { id: 'quarterly',  label: 'Quarterly',        per: 'qt',  toMonthly: a => a / 3 },
+  { id: 'yearly',     label: 'Yearly',           per: 'yr',  toMonthly: a => a / 12 },
 ];
 
 const STATUSES = [
@@ -102,6 +104,7 @@ function newSubscription() {
     frequency: 'monthly', category: 'Other', nextChargeDate: '', autoRenews: true,
     paymentLabel: '', status: 'active', lastUsedDate: '', notes: '',
     taxIncluded: true, noticeDays: 0, emailAlert: false,
+    isFinite: false, remainingPayments: null,   // short-term recurring: N payments then done
     priceHistory: [], createdAt: now, updatedAt: now,
   };
 }
@@ -947,12 +950,29 @@ function renderUpcoming() {
 function stepDate(d, freq) {
   const x = new Date(d);
   switch (freq) {
-    case 'weekly':    x.setDate(x.getDate() + 7); break;
-    case 'quarterly': x.setMonth(x.getMonth() + 3); break;
-    case 'yearly':    x.setFullYear(x.getFullYear() + 1); break;
-    default:          x.setMonth(x.getMonth() + 1);
+    case 'weekly':      x.setDate(x.getDate() + 7);  break;
+    case 'biweekly':    x.setDate(x.getDate() + 14); break;
+    case 'fourweekly':  x.setDate(x.getDate() + 28); break;
+    case 'quarterly':   x.setMonth(x.getMonth() + 3); break;
+    case 'yearly':      x.setFullYear(x.getFullYear() + 1); break;
+    default:            x.setMonth(x.getMonth() + 1);
   }
   return x;
+}
+
+// Given a finite stream's nextChargeDate + remainingPayments, return the
+// Date of the final charge, or null if the stream is not finite / missing data.
+function finiteEndDate(sub) {
+  if (!sub.isFinite || !(sub.remainingPayments >= 1) || !sub.nextChargeDate) return null;
+  let d = parseDate(sub.nextChargeDate);
+  if (!d) return null;
+  for (let i = 1; i < sub.remainingPayments; i++) d = stepDate(d, sub.frequency);
+  return d;
+}
+
+// Format a Date as YYYY-MM-DD string.
+function dateToStr(d) {
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 }
 
 // ─── Auto-advance overdue charge dates ────────────────────────────
@@ -961,6 +981,11 @@ function stepDate(d, freq) {
 // the future. This means the app self-corrects without any user action.
 // Only streams with autoRenews:true are advanced (manually-managed streams
 // are left alone so the overdue reminder stays visible).
+//
+// Finite (installment) streams: each time the date steps forward, one payment
+// has occurred, so remainingPayments drops in lockstep. When it hits 0 the
+// plan is complete — we stop advancing and mark the stream cancelled (a
+// finished installment plan is a genuine terminal state, not a forgotten sub).
 function advanceOverdueDates() {
   const today = startOfToday();
   let changed = false;
@@ -969,25 +994,47 @@ function advanceOverdueDates() {
     if (!s.nextChargeDate || !s.autoRenews) continue;
     let d = parseDate(s.nextChargeDate);
     if (!d || d >= today) continue;   // already current
+
+    const isFin = s.isFinite && s.remainingPayments >= 1;
+    let remaining = isFin ? s.remainingPayments : null;
     let guard = 0;
-    while (d < today && guard++ < 3000) d = stepDate(d, s.frequency);
-    const next = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
-    if (next !== s.nextChargeDate) {
-      s.nextChargeDate = next;
-      s.updatedAt = Date.now();
-      changed = true;
+    // Step forward one billing cycle at a time. For finite streams each step
+    // consumes a payment; stop once the plan is exhausted even if still in the
+    // past (the final charge already happened).
+    while (d < today && guard++ < 3000) {
+      if (isFin && remaining <= 1) break;   // last payment already occurred
+      d = stepDate(d, s.frequency);
+      if (isFin) remaining -= 1;
     }
+
+    const next = dateToStr(d);
+    let rowChanged = false;
+    if (next !== s.nextChargeDate) { s.nextChargeDate = next; rowChanged = true; }
+    if (isFin && remaining !== s.remainingPayments) { s.remainingPayments = remaining; rowChanged = true; }
+
+    // Finite plan complete: the final charge date is in the past and no
+    // payments remain. Retire the stream so it stops counting toward flow.
+    if (isFin && remaining <= 1 && parseDate(s.nextChargeDate) < today) {
+      if (s.status !== 'cancelled') { s.status = 'cancelled'; rowChanged = true; }
+    }
+
+    if (rowChanged) { s.updatedAt = Date.now(); changed = true; }
   }
   if (changed) markDirty();
 }
 
 function chargeDatesWithin(sub, start, end) {
   const out = [];
+  const hardEnd = sub.isFinite ? finiteEndDate(sub) : null;  // null = perpetual
+  // If the stream has already exhausted its payments, nothing to project.
+  if (hardEnd && hardEnd < start) return out;
+  const effectiveEnd = (hardEnd && hardEnd < end) ? new Date(hardEnd.getTime() + 1) : end;
+
   let anchor = parseDate(sub.nextChargeDate) || new Date(start); // no date → from today
   let guard = 0;
   while (anchor < start && guard++ < 3000) anchor = stepDate(anchor, sub.frequency);
   let d = new Date(anchor); guard = 0;
-  while (d < end && guard++ < 3000) { out.push(new Date(d)); d = stepDate(d, sub.frequency); }
+  while (d < effectiveEnd && guard++ < 3000) { out.push(new Date(d)); d = stepDate(d, sub.frequency); }
   return out;
 }
 
@@ -1120,6 +1167,13 @@ function renderStreams(animate = true) {
     if (s.status === 'trial')     pills.push('<span class="pill pill-trial">Trial</span>');
     if (s.status === 'paused')    pills.push('<span class="pill pill-paused">Paused</span>');
     if (s.status === 'cancelled') pills.push('<span class="pill pill-cancelled">Cancelled</span>');
+    if (s.isFinite && isActive(s)) {
+      const n = s.remainingPayments;
+      const endD = finiteEndDate(s);
+      const endStr = endD ? endD.toLocaleDateString(undefined, { month: 'short', year: 'numeric' }) : '';
+      const label = n === 1 ? 'Last payment' : n >= 1 ? `${n} left` : 'Finite';
+      pills.push(`<span class="pill pill-finite" title="${endStr ? 'Ends ' + endStr : ''}">${label}</span>`);
+    }
     if (isLeak(s))                pills.push('<span class="pill pill-leak">Leak</span>');
 
     const next = (isActive(s) && days != null)
@@ -1234,6 +1288,16 @@ function openSubModal(id = null) {
   $('#sub-status-msg').textContent = '';
   $('#sub-delete').style.display = id ? '' : 'none';
 
+  // Finite / installment fields
+  const isFiniteCheck = $('#sub-is-finite');
+  const finiteGroup   = $('#sub-finite-group');
+  if (isFiniteCheck && finiteGroup) {
+    isFiniteCheck.checked = !!sub.isFinite;
+    $('#sub-remaining').value = sub.remainingPayments || '';
+    finiteGroup.style.display = sub.isFinite ? '' : 'none';
+    updateFiniteEndLabel();
+  }
+
   const ph = $('#price-history');
   if (ph) {
     const html = id && sub ? renderPriceHistory(sub) : '';
@@ -1252,6 +1316,16 @@ function saveSubscription() {
   if (!name)              { msg.textContent = 'Give the stream a name.'; return; }
   if (isNaN(amount) || amount < 0) { msg.textContent = 'Enter a valid amount.'; return; }
 
+  const isFiniteChecked = !!$('#sub-is-finite')?.checked;
+  const remainingRaw = parseInt($('#sub-remaining')?.value, 10);
+  const remainingPayments = isFiniteChecked && remainingRaw >= 1 ? remainingRaw : null;
+
+  if (isFiniteChecked && !(remainingPayments >= 1)) {
+    const msg = $('#sub-status-msg');
+    msg.textContent = 'Enter how many payments remain (at least 1).';
+    return;
+  }
+
   const fields = {
     name, amount,
     currency:  $('#sub-currency').value,
@@ -1265,6 +1339,8 @@ function saveSubscription() {
     taxIncluded: $('#sub-tax').checked,
     autoRenews: $('#sub-autorenew').checked,
     notes: $('#sub-notes').value.trim(),
+    isFinite: isFiniteChecked,
+    remainingPayments,
     updatedAt: Date.now(),
   };
 
@@ -1376,6 +1452,25 @@ async function importBackup(file) {
   } catch { toast('⚠️ That file could not be read as a Rivulet backup'); }
 }
 
+// Compute and display the "Last payment: Mon DD, YYYY" hint in the modal.
+// Called whenever the frequency, next-charge date, or remaining-payments change.
+function updateFiniteEndLabel() {
+  const el = $('#sub-finite-end-label');
+  if (!el) return;
+  const isFiniteChecked = !!$('#sub-is-finite')?.checked;
+  if (!isFiniteChecked) { el.textContent = ''; return; }
+  const remaining = parseInt($('#sub-remaining')?.value, 10);
+  const nextDate  = $('#sub-next-date')?.value;
+  const freq      = $('#sub-frequency')?.value || 'monthly';
+  if (!(remaining >= 1) || !nextDate) { el.textContent = ''; return; }
+  // Build a temporary stub to reuse finiteEndDate logic.
+  const stub = { isFinite: true, remainingPayments: remaining, nextChargeDate: nextDate, frequency: freq };
+  const end = finiteEndDate(stub);
+  if (!end) { el.textContent = ''; return; }
+  const label = end.toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' });
+  el.textContent = `Last payment: ${label}`;
+}
+
 // ─── Event wiring ─────────────────────────────────────────────────
 function wireEvents() {
   $('#btn-settings').addEventListener('click', openSettings);
@@ -1391,6 +1486,17 @@ function wireEvents() {
 
   $('#sub-save').addEventListener('click', saveSubscription);
   $('#sub-delete').addEventListener('click', deleteSubscription);
+
+  // Finite / installment controls
+  $('#sub-is-finite').addEventListener('change', e => {
+    $('#sub-finite-group').style.display = e.target.checked ? '' : 'none';
+    updateFiniteEndLabel();
+  });
+  ['#sub-remaining', '#sub-next-date', '#sub-frequency'].forEach(sel => {
+    const el = $(sel);
+    if (el) el.addEventListener('change', updateFiniteEndLabel);
+    if (el) el.addEventListener('input', updateFiniteEndLabel);
+  });
 
   // modal close buttons + overlay click + Esc
   $$('[data-close]').forEach(b => b.addEventListener('click', () => closeModal(b.dataset.close)));
