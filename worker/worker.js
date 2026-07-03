@@ -39,22 +39,76 @@ const GOOGLE_CERTS = 'https://www.googleapis.com/oauth2/v3/certs';
 const GOOGLE_ISS  = ['accounts.google.com', 'https://accounts.google.com'];
 
 // ─── HTTP helpers ─────────────────────────────────────────────────
-function cors(extra = {}) {
-  return {
-    'Access-Control-Allow-Origin':  '*',
+// ─── Origin allowlist ─────────────────────────────────────────────
+// ALLOWED_ORIGINS is a comma-separated list of origins permitted to use this
+// worker (e.g. "https://you.github.io,http://localhost:3000"). It's more than
+// CORS: unlisted browser origins are rejected outright before any handler runs,
+// so the worker won't act as a backend for sites you didn't authorize.
+//
+// Fails CLOSED: if ALLOWED_ORIGINS is unset or empty, every data/auth route is
+// blocked until you configure it — a missing config is loud, not silently open.
+// The health check (GET /) stays open so you can confirm the worker is alive.
+//
+// Caveat: the Origin header is browser-set, so this stops other *websites* and
+// casual cross-site abuse, not a direct scripted client (curl) that sets its own
+// headers. Real data protection is still the HMAC / Google-token auth on each
+// storage and migrate request; this is a defense-in-depth layer on top.
+function parseAllowedOrigins(env) {
+  return String(env.ALLOWED_ORIGINS || '')
+    .split(',').map(s => s.trim()).filter(Boolean);
+}
+
+// Resolve the reflected origin for a request, or a verdict for the gate.
+//   { allowed: true,  origin }  → permitted; reflect `origin` (may be null for
+//                                 non-browser requests with no Origin header)
+//   { allowed: false }          → a browser origin that isn't on the list
+function resolveOrigin(request, env) {
+  const origin = request.headers.get('Origin');
+  const list = parseAllowedOrigins(env);
+  // No Origin header → not a cross-site browser call. Let it reach the auth
+  // layer (which still requires a valid token/signature); nothing to reflect.
+  if (!origin) return { allowed: true, origin: null };
+  if (list.includes(origin)) return { allowed: true, origin };
+  return { allowed: false };
+}
+
+// Build CORS headers reflecting a specific allowed origin. When `origin` is a
+// concrete allowed value we echo it (and Vary: Origin so caches stay correct);
+// when null (non-browser request) we omit the ACAO header entirely.
+function cors(origin = null, extra = {}) {
+  const headers = {
     'Access-Control-Allow-Methods': 'GET, PUT, POST, OPTIONS',
     'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Timestamp, X-Signature',
     'Access-Control-Expose-Headers': 'X-Token-Migrated',  // so the browser can read it
+    'Vary': 'Origin',
     ...extra,
   };
+  if (origin) headers['Access-Control-Allow-Origin'] = origin;
+  return headers;
 }
+// Request-scoped reflected origin. Set once at the top of fetch() AFTER the
+// origin gate has rejected any disallowed browser origin, so this only ever
+// holds one of your own configured origins (or null for non-browser requests).
+// Reset per request; handlers read it via cors() without threading a parameter.
+let _reqOrigin = null;
+
 function json(obj, status = 200, extra = {}) {
   return new Response(JSON.stringify(obj), {
-    status, headers: { 'Content-Type': 'application/json', ...cors(extra) },
+    status, headers: { 'Content-Type': 'application/json', ...cors(_reqOrigin, extra) },
   });
 }
-function gone()         { return new Response('Gone',          { status: 410, headers: cors() }); }
+function gone()         { return new Response('Gone', { status: 410, headers: cors(_reqOrigin) }); }
 function unauthorized() { return json({ ok: false, error: 'unauthorized' }, 401); }
+
+// A disallowed origin never reaches a handler — rejected at the gate. This
+// response deliberately carries no Access-Control-Allow-Origin, so the browser
+// blocks the caller from reading it.
+function forbiddenOrigin() {
+  return new Response(JSON.stringify({ ok: false, error: 'origin not allowed' }), {
+    status: 403,
+    headers: { 'Content-Type': 'application/json', 'Vary': 'Origin' },
+  });
+}
 
 // ─── Encoding helpers ─────────────────────────────────────────────
 const enc = new TextEncoder();
@@ -257,15 +311,28 @@ async function authMigrate(env, request) {
 // ─── Router ───────────────────────────────────────────────────────
 export default {
   async fetch(request, env) {
-    if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: cors() });
-
     const url  = new URL(request.url);
     const path = url.pathname;
 
+    // Health check is always open: no data, no auth, reachable in a browser to
+    // confirm the worker is alive even before ALLOWED_ORIGINS is configured.
+    if (path === '/' && request.method === 'GET') {
+      const origin = request.headers.get('Origin');
+      const ok = !origin || parseAllowedOrigins(env).includes(origin);
+      return new Response('Rivulet sync worker — ok', { status: 200, headers: cors(ok ? origin : null) });
+    }
+
+    // Origin gate for everything else. Resolve once, up front; a disallowed
+    // browser origin is rejected here before any handler (or preflight) runs.
+    const verdict = resolveOrigin(request, env);
+    if (!verdict.allowed) return forbiddenOrigin();
+    _reqOrigin = verdict.origin;   // request-scoped; only ever an allowed origin
+
+    if (request.method === 'OPTIONS') {
+      return new Response(null, { status: 204, headers: cors(_reqOrigin) });
+    }
+
     try {
-      if (path === '/' && request.method === 'GET') {
-        return new Response('Rivulet sync worker — ok', { status: 200, headers: cors() });
-      }
       if (path === '/auth/config' && request.method === 'GET') {
         return json({ googleClientId: env.GOOGLE_CLIENT_ID || '' });
       }
