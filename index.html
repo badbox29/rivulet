@@ -172,6 +172,24 @@
         </div>
       </div>
 
+      <!-- Short-term recurring / installment toggle -->
+      <div class="form-group finite-toggle-group">
+        <label class="form-check">
+          <input type="checkbox" id="sub-is-finite"/>
+          <span>Short-term recurring payment <span class="muted">(has a fixed number of payments)</span></span>
+        </label>
+      </div>
+      <div id="sub-finite-group" class="finite-group" style="display:none;">
+        <div class="finite-inner">
+          <div class="form-group finite-count-group">
+            <label class="form-label" for="sub-remaining">Payments remaining</label>
+            <input class="input input-mono finite-count-input" id="sub-remaining" inputmode="numeric" placeholder="e.g. 5" min="1"/>
+          </div>
+          <span class="finite-hint" id="sub-finite-end-label"></span>
+        </div>
+        <p class="form-hint finite-hint-text">Based on the billing frequency and next charge date above. The last payment date updates automatically.</p>
+      </div>
+
       <div class="form-row">
         <div class="form-group">
           <label class="form-label" for="sub-category">Category</label>
