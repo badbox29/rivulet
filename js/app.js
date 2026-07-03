@@ -728,11 +728,17 @@ function renderApp() {
 
   renderRemindersBadge();
 
-  if (!has) { $('#upcoming-section').hidden = true; $('#projection-section').hidden = true; return; }
+  if (!has) {
+    $('#upcoming-section').hidden = true;
+    $('#projection-section').hidden = true;
+    $('#installments-section').hidden = true;
+    return;
+  }
 
   renderHero();
   renderProjection();
   renderUpcoming();
+  renderInstallments();
   renderStreams();
 }
 
@@ -944,7 +950,88 @@ function renderUpcoming() {
   markEntering($('#upcoming-list'));
 }
 
-// ─── Projections ──────────────────────────────────────────────────
+// ─── Installments (finite payment plans) ──────────────────────────
+// A summary of active finite streams: what's still owed in total, and the
+// "relief" — how much monthly flow returns as each plan finishes. This is
+// insight a flat list can't show: a finite plan is a drain with a known end.
+function activeInstallments() {
+  return App.data.subscriptions
+    .filter(s => isActive(s) && s.isFinite && s.remainingPayments >= 1)
+    .map(s => ({
+      s,
+      end: finiteEndDate(s),
+      owed: convertAmount((Number(s.amount) || 0) * s.remainingPayments, s.currency, displayCurrency()),
+      relief: normMonthly(s),   // monthly flow that returns when this plan ends
+    }))
+    .sort((a, b) => {
+      if (!a.end) return 1; if (!b.end) return -1;
+      return a.end - b.end;   // soonest to finish first
+    });
+}
+
+function renderInstallments() {
+  const section = $('#installments-section');
+  if (!section) return;
+  const plans = activeInstallments();
+  if (!plans.length) { section.hidden = true; return; }
+  section.hidden = false;
+
+  const totalOwed = plans.reduce((sum, p) => sum + p.owed, 0);
+  $('#installments-total').textContent = `${formatMoney(totalOwed)} owed`;
+
+  // Relief headline — lead with the soonest plan to finish, since that relief
+  // arrives first. Fall back gracefully if a plan is missing an end date.
+  const next = plans.find(p => p.end);
+  const relief = $('#installments-relief');
+  if (next) {
+    const when = next.end.toLocaleDateString(undefined, { month: 'long', year: 'numeric' });
+    const monthlyRelief = plans
+      .filter(p => p.end && sameMonth(p.end, next.end))
+      .reduce((sum, p) => sum + p.relief, 0);
+    const more = plans.length > 1
+      ? ` · ${formatMoney(totalReliefMonthly(plans))}/mo returns once all ${plans.length} finish`
+      : '';
+    relief.innerHTML = `Your flow drops by <b>${formatMoney(monthlyRelief)}/mo</b> after ${when}${more}`;
+  } else {
+    relief.textContent = '';
+  }
+
+  $('#installments-list').innerHTML = plans.map(({ s, end, owed }) => {
+    const f = freqOf(s.frequency);
+    const n = s.remainingPayments;
+    const left = n === 1 ? 'last payment' : `${n} payments left`;
+    const endStr = end ? end.toLocaleDateString(undefined, { month: 'short', year: 'numeric' }) : '';
+    return `
+      <li class="installment-row" data-id="${s.id}" role="button" tabindex="0">
+        <span class="installment-main">
+          <span class="installment-name">${esc(s.name || 'Untitled')}</span>
+          <span class="installment-meta">${esc(left)}${endStr ? ` · ends ${esc(endStr)}` : ''}</span>
+        </span>
+        <span class="installment-right">
+          <span class="installment-amt">${formatMoney(s.amount, s.currency)}<span class="per">/${f.per}</span></span>
+          <span class="installment-owed">${formatMoney(owed)} left</span>
+        </span>
+      </li>`;
+  }).join('');
+
+  $$('#installments-list .installment-row').forEach(row => {
+    const open = () => openSubModal(row.dataset.id);
+    row.addEventListener('click', open);
+    row.addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); open(); } });
+  });
+
+  markEntering($('#installments-list'));
+}
+
+// Total monthly flow that returns once every listed plan has finished.
+function totalReliefMonthly(plans) {
+  return plans.reduce((sum, p) => sum + p.relief, 0);
+}
+
+// True when two Dates fall in the same calendar month and year.
+function sameMonth(a, b) {
+  return a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth();
+}
 // Forecast cumulative spend over a horizon by walking each active stream's
 // charge dates forward and bucketing converted amounts by month.
 function stepDate(d, freq) {
