@@ -982,20 +982,23 @@ function dateToStr(d) {
 // Only streams with autoRenews:true are advanced (manually-managed streams
 // are left alone so the overdue reminder stays visible).
 //
-// Finite (installment) streams: each time the date steps forward, one payment
-// has occurred, so remainingPayments drops in lockstep. When it hits 0 the
-// plan is complete — we stop advancing and mark the stream cancelled (a
-// finished installment plan is a genuine terminal state, not a forgotten sub).
+// Finite (installment) streams are the exception: they always advance even
+// though autoRenews is off, because an installment plan self-tracks its own
+// schedule. Each step forward consumes one payment, so remainingPayments
+// drops in lockstep. When it hits 0 the plan is complete — we stop advancing
+// and mark the stream cancelled (a finished plan is a genuine terminal state,
+// not a forgotten sub).
 function advanceOverdueDates() {
   const today = startOfToday();
   let changed = false;
   for (const s of App.data.subscriptions) {
     if (s.status !== 'active' && s.status !== 'trial') continue;
-    if (!s.nextChargeDate || !s.autoRenews) continue;
+    if (!s.nextChargeDate) continue;
+    const isFin = s.isFinite && s.remainingPayments >= 1;
+    if (!s.autoRenews && !isFin) continue;   // finite plans advance without autoRenews
     let d = parseDate(s.nextChargeDate);
     if (!d || d >= today) continue;   // already current
 
-    const isFin = s.isFinite && s.remainingPayments >= 1;
     let remaining = isFin ? s.remainingPayments : null;
     let guard = 0;
     // Step forward one billing cycle at a time. For finite streams each step
@@ -1295,6 +1298,11 @@ function openSubModal(id = null) {
     isFiniteCheck.checked = !!sub.isFinite;
     $('#sub-remaining').value = sub.remainingPayments || '';
     finiteGroup.style.display = sub.isFinite ? '' : 'none';
+    // Reflect the finite⇄auto-renew exclusivity without clobbering a stored
+    // value: only force auto-renew when the stream is finite. Otherwise show
+    // the stream's own autoRenews (set a few lines above) and keep it editable.
+    if (sub.isFinite) { $('#sub-autorenew').checked = false; $('#sub-autorenew').disabled = true; }
+    else              { $('#sub-autorenew').disabled = false; }
     updateFiniteEndLabel();
   }
 
@@ -1337,7 +1345,7 @@ function saveSubscription() {
     lastUsedDate: $('#sub-lastused').value,
     noticeDays: Math.max(0, parseInt($('#sub-notice').value, 10) || 0),
     taxIncluded: $('#sub-tax').checked,
-    autoRenews: $('#sub-autorenew').checked,
+    autoRenews: isFiniteChecked ? false : $('#sub-autorenew').checked,
     notes: $('#sub-notes').value.trim(),
     isFinite: isFiniteChecked,
     remainingPayments,
@@ -1452,6 +1460,17 @@ async function importBackup(file) {
   } catch { toast('⚠️ That file could not be read as a Rivulet backup'); }
 }
 
+// An installment plan doesn't auto-renew — the two are mutually exclusive.
+// When finite is on, force auto-renew off and lock it (a disabled, unchecked
+// box reads as "not applicable"); when finite is off, restore the normal
+// default (on + editable).
+function syncAutoRenewForFinite(isFinite) {
+  const ar = $('#sub-autorenew');
+  if (!ar) return;
+  if (isFinite) { ar.checked = false; ar.disabled = true; }
+  else          { ar.disabled = false; ar.checked = true; }
+}
+
 // Compute and display the "Last payment: Mon DD, YYYY" hint in the modal.
 // Called whenever the frequency, next-charge date, or remaining-payments change.
 function updateFiniteEndLabel() {
@@ -1490,6 +1509,7 @@ function wireEvents() {
   // Finite / installment controls
   $('#sub-is-finite').addEventListener('change', e => {
     $('#sub-finite-group').style.display = e.target.checked ? '' : 'none';
+    syncAutoRenewForFinite(e.target.checked);
     updateFiniteEndLabel();
   });
   ['#sub-remaining', '#sub-next-date', '#sub-frequency'].forEach(sel => {
