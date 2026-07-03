@@ -1,0 +1,1742 @@
+/**
+ * ============================================================
+ * Rivulet — app.js
+ * ============================================================
+ * App-specific logic: data model, localStorage + Cloudflare Worker
+ * sync, boot orchestration, and the UI (dashboard, streams, CRUD).
+ * auth.js is the standalone, portable auth module — this file is the
+ * host side that supplies its config via Auth.init() in boot().
+ *
+ * Account types (handled by auth.js): guest / token / google.
+ * One-way upgrades: guest → token|google, token → google.
+ * Worker contract is documented in AUTH-INTEGRATION.md.
+ * ============================================================ */
+
+'use strict';
+
+// ─── Constants ────────────────────────────────────────────────────
+const STORAGE_KEY         = 'riv_appdata';
+const STORAGE_AUTH_KEY    = 'riv_google_id_token';
+const STORAGE_DISMISS_KEY = 'riv_token_upgrade_dismissed';
+
+const SYNC_THRESHOLD_MS      = 30 * 1000;
+const SYNC_CHECK_INTERVAL_MS = 15 * 1000;
+
+const CATEGORIES = ['Automotive', 'Cloud', 'Communication', 'Development', 'Education',
+  'Entertainment', 'Family', 'Finance', 'Fitness', 'Food', 'Gaming', 'Health', 'Home',
+  'Insurance', 'Music', 'News', 'Pets', 'Productivity', 'Security', 'Shopping', 'Travel',
+  'Utilities', 'Other'];
+
+const FREQUENCIES = [
+  { id: 'weekly',      label: 'Weekly',         per: 'wk',  toMonthly: a => a * 52 / 12 },
+  { id: 'biweekly',   label: 'Every 2 weeks',   per: '2wk', toMonthly: a => a * 26 / 12 },
+  { id: 'fourweekly', label: 'Every 4 weeks',   per: '4wk', toMonthly: a => a * 13 / 12 },
+  { id: 'monthly',    label: 'Monthly',          per: 'mo',  toMonthly: a => a },
+  { id: 'quarterly',  label: 'Quarterly',        per: 'qt',  toMonthly: a => a / 3 },
+  { id: 'yearly',     label: 'Yearly',           per: 'yr',  toMonthly: a => a / 12 },
+];
+
+const STATUSES = [
+  { id: 'active',    label: 'Active' },
+  { id: 'trial',     label: 'Trial' },
+  { id: 'paused',    label: 'Paused' },
+  { id: 'cancelled', label: 'Cancelled' },
+];
+
+const CURRENCIES = ['USD', 'EUR', 'GBP', 'CAD', 'AUD', 'JPY', 'INR', 'BRL', 'MXN'];
+
+const LEAK_DAYS = 90;
+
+// ─── App state ────────────────────────────────────────────────────
+const App = {
+  data: null,
+  syncCheckTimer: null,
+  filter: 'all',        // status filter
+  search: '',
+  editingId: null,      // id of subscription being edited, or null when adding
+  heroView: 'stream',   // 'stream' | 'category' — what the hero bars show
+  categoryFilter: null, // selected category name, or null
+  projMonths: 12,       // projection horizon (6 | 12 | 24)
+};
+
+// ─── Data model ───────────────────────────────────────────────────
+function defaultData() {
+  return {
+    authMethod:   'guest',
+    userToken:    Auth.generateToken(),
+    workerUrl:    '',
+    linkedGoogle: null,
+    firstName: '', lastName: '', username: '',
+    subscriptions:  [],
+    paymentMethods: [],
+    settings: { currency: 'USD', flowView: 'monthly', reminderLeads: [7, 1], notifyBrowser: false,
+                capacityAmount: 0, capacityPeriod: 'monthly', theme: 'light' },
+    dismissedReminders: {},   // reminderId → date dismissed (re-surfaces next cycle)
+    lastNotifyDate: '',       // YYYY-MM-DD of the last browser notification (once/day)
+    lastSyncTime: 0, pendingSync: false, lastModified: Date.now(),
+  };
+}
+
+function mergeData(raw) {
+  const d = defaultData();
+  if (!raw || typeof raw !== 'object') return d;
+  return {
+    ...d, ...raw,
+    subscriptions:  Array.isArray(raw.subscriptions)  ? raw.subscriptions  : d.subscriptions,
+    paymentMethods: Array.isArray(raw.paymentMethods) ? raw.paymentMethods : d.paymentMethods,
+    dismissedReminders: (raw.dismissedReminders && typeof raw.dismissedReminders === 'object')
+      ? raw.dismissedReminders : d.dismissedReminders,
+    settings: (raw.settings && typeof raw.settings === 'object')
+      ? { ...d.settings, ...raw.settings,
+          reminderLeads: Array.isArray(raw.settings.reminderLeads) ? raw.settings.reminderLeads : d.settings.reminderLeads,
+          capacityAmount: (Number.isFinite(+raw.settings.capacityAmount) && +raw.settings.capacityAmount > 0) ? +raw.settings.capacityAmount : 0,
+          capacityPeriod: raw.settings.capacityPeriod === 'annual' ? 'annual' : 'monthly',
+          theme: raw.settings.theme === 'dark' ? 'dark' : 'light' }
+      : d.settings,
+  };
+}
+
+// One subscription ("stream") record.
+function newSubscription() {
+  const now = Date.now();
+  return {
+    id: uid(), name: '', amount: 0, currency: App.data?.settings?.currency || 'USD',
+    frequency: 'monthly', category: 'Other', nextChargeDate: '', autoRenews: true,
+    paymentLabel: '', status: 'active', lastUsedDate: '', notes: '',
+    taxIncluded: true, noticeDays: 0, emailAlert: false,
+    isFinite: false, remainingPayments: null,   // short-term recurring: N payments then done
+    priceHistory: [], createdAt: now, updatedAt: now,
+  };
+}
+
+// ─── Small utilities ──────────────────────────────────────────────
+const uid = () => (crypto.randomUUID ? crypto.randomUUID()
+  : 'id-' + Date.now().toString(36) + '-' + Math.random().toString(16).slice(2));
+const $  = (sel, root = document) => root.querySelector(sel);
+const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
+const esc = s => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+
+const ls = {
+  get:    k => { try { const v = localStorage.getItem(k); return v ? JSON.parse(v) : null; } catch { return null; } },
+  set:    (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) { console.error('[Rivulet] localStorage.set failed:', e); } },
+  remove: k => { try { localStorage.removeItem(k); } catch {} },
+};
+
+function saveLocal() {
+  try { localStorage.setItem(STORAGE_KEY, JSON.stringify(App.data)); }
+  catch (e) { console.error('[Rivulet] saveLocal failed:', e); toast('⚠️ Could not save — storage may be full'); }
+}
+
+function markDirty() {
+  App.data.pendingSync = true;
+  App.data.lastModified = Date.now();
+  saveLocal();
+  updateSyncIndicator();
+}
+
+function updateSyncIndicator() {
+  const el = $('#sync-indicator');
+  if (el) el.style.display = (App.data?.pendingSync && getWorkerUrl()) ? '' : 'none';
+}
+
+// ─── Domain calculations ──────────────────────────────────────────
+function freqOf(id)   { return FREQUENCIES.find(f => f.id === id) || FREQUENCIES[1]; }
+function monthly(sub) { return freqOf(sub.frequency).toMonthly(Number(sub.amount) || 0); }
+function isActive(sub){ return sub.status === 'active'; }
+
+// ── Currency normalization ──
+// Approximate, static FX rates expressed as USD per 1 unit. Good enough to make
+// mixed-currency totals meaningful; clearly labeled as approximate in the UI.
+// Single-currency portfolios never touch these (convertAmount short-circuits).
+// Live or user-editable rates can replace this table later without touching callers.
+const FX_USD = { USD: 1, EUR: 1.08, GBP: 1.27, CAD: 0.73, AUD: 0.66, JPY: 0.0067, INR: 0.012, BRL: 0.18, MXN: 0.055 };
+function fxRate(cur) { return FX_USD[cur] || 1; }
+function displayCurrency() { return (App.data && App.data.settings && App.data.settings.currency) || 'USD'; }
+function convertAmount(amount, from, to) {
+  const a = Number(amount) || 0;
+  if (!from || from === to) return a;
+  return a * fxRate(from) / fxRate(to);
+}
+// A subscription's monthly cost converted into the display currency.
+function normMonthly(sub) { return convertAmount(monthly(sub), sub.currency, displayCurrency()); }
+// True when active streams span more than one currency (drives the "approx" note).
+function hasMixedCurrencies() {
+  const cur = new Set(App.data.subscriptions.filter(isActive).map(s => s.currency || 'USD'));
+  return cur.size > 1;
+}
+
+function activeMonthlyTotal() {
+  return App.data.subscriptions.filter(isActive).reduce((sum, s) => sum + normMonthly(s), 0);
+}
+
+// ─── Capacity ─────────────────────────────────────────────────────
+// An optional personal ceiling (NOT a budget). The amount is held in the
+// display currency; we normalize it to a monthly figure so the ratio is
+// the same whether the hero shows monthly or annual.
+function capacityMonthly() {
+  const amt = +App.data.settings.capacityAmount || 0;
+  if (amt <= 0) return 0;
+  return App.data.settings.capacityPeriod === 'annual' ? amt / 12 : amt;
+}
+// Total active flow as a fraction of capacity (0..∞), or null when unset.
+function capacityRatio() {
+  const cap = capacityMonthly();
+  if (cap <= 0) return null;
+  return activeMonthlyTotal() / cap;
+}
+// Band for a ratio: 'ok' (<75%) | 'near' (75–100%) | 'over' (>100%); null if unset.
+function capacityBand(ratio = capacityRatio()) {
+  if (ratio == null) return null;
+  if (ratio > 1)     return 'over';
+  if (ratio >= 0.75) return 'near';
+  return 'ok';
+}
+
+// Monthly spend on active streams in one category, in the display currency.
+function categoryMonthly(cat) {
+  return App.data.subscriptions
+    .filter(s => isActive(s) && s.category === cat)
+    .reduce((sum, s) => sum + normMonthly(s), 0);
+}
+
+// Categories that have at least one active stream, with their monthly spend
+// and active count, ranked by spend. "Used categories only" — the breakdown
+// never shows an empty tributary.
+function usedCategories() {
+  const agg = {};
+  for (const s of App.data.subscriptions) {
+    if (!isActive(s)) continue;
+    (agg[s.category] = agg[s.category] || { category: s.category, total: 0, count: 0 });
+    agg[s.category].total += normMonthly(s);
+    agg[s.category].count += 1;
+  }
+  return Object.values(agg).sort((a, b) => b.total - a.total);
+}
+
+function formatMoney(n, currency = displayCurrency()) {
+  const v = Number(n) || 0;
+  try {
+    return new Intl.NumberFormat(undefined, {
+      style: 'currency', currency,
+      minimumFractionDigits: Number.isInteger(v) ? 0 : 2,
+      maximumFractionDigits: 2,
+    }).format(v);
+  } catch { return '$' + v.toFixed(2); }
+}
+
+function parseDate(str) {
+  if (!str) return null;
+  const [y, m, d] = str.split('-').map(Number);
+  if (!y || !m || !d) return null;
+  return new Date(y, m - 1, d);
+}
+function startOfToday() { const t = new Date(); t.setHours(0, 0, 0, 0); return t; }
+function daysUntil(str) { const d = parseDate(str); if (!d) return null; return Math.round((d - startOfToday()) / 86400000); }
+function daysSince(str) { const d = parseDate(str); if (!d) return null; return Math.round((startOfToday() - d) / 86400000); }
+
+function isLeak(sub) {
+  if (!isActive(sub) || !sub.lastUsedDate) return false;
+  const since = daysSince(sub.lastUsedDate);
+  return since != null && since > LEAK_DAYS;
+}
+
+function whenLabel(days) {
+  if (days == null) return '';
+  if (days < 0)  return `${Math.abs(days)}d overdue`;
+  if (days === 0) return 'today';
+  if (days === 1) return 'tomorrow';
+  return `in ${days} days`;
+}
+
+// ─── Price increases & savings ────────────────────────────────────
+function pctChange(from, to) { return from ? ((to - from) / from) * 100 : null; }
+
+// latestIncrease(sub) — the most recent price-history step, if it was a rise.
+function latestIncrease(sub) {
+  const h = (sub.priceHistory || []).filter(p => p && typeof p.amount === 'number');
+  if (h.length < 2) return null;
+  const last = h[h.length - 1], prev = h[h.length - 2];
+  if (last.amount > prev.amount) {
+    return { from: prev.amount, to: last.amount, pct: pctChange(prev.amount, last.amount), date: last.date };
+  }
+  return null;
+}
+function recentIncrease(sub, withinDays = 90) {
+  const inc = latestIncrease(sub);
+  if (!inc) return null;
+  const since = daysSince(inc.date);
+  return (since == null || since <= withinDays) ? inc : null;
+}
+
+// Monthly cost currently going to leaks (active streams unused > LEAK_DAYS).
+function leakMonthly() {
+  return App.data.subscriptions.filter(isLeak).reduce((sum, s) => sum + normMonthly(s), 0);
+}
+
+// ─── Reminders engine ─────────────────────────────────────────────
+// Surfaces what needs attention: upcoming renewals (by lead time), cancel-by
+// deadlines (notice periods), trial endings, and recent price increases.
+// Each reminder has a stable id within its billing cycle, so dismissing one
+// hides it until the next cycle (when the date — and thus the id — changes).
+const REMINDER_OVERDUE_GRACE = 14;  // days after a passed date we still nudge
+
+function reminderDismissed(id) {
+  return !!(App.data.dismissedReminders && App.data.dismissedReminders[id]);
+}
+
+function computeReminders() {
+  const out   = [];
+  const leads = (App.data.settings.reminderLeads || [7, 1]).slice().sort((a, b) => b - a);
+  const maxLead = leads.length ? leads[0] : 7;
+  const minLead = leads.length ? leads[leads.length - 1] : 1;
+  const push = r => { if (!reminderDismissed(r.id)) out.push(r); };
+
+  for (const s of App.data.subscriptions) {
+    const name = s.name || 'Untitled';
+    const amt  = formatMoney(s.amount, s.currency);
+
+    // Upcoming renewal (active)
+    if (s.status === 'active' && s.nextChargeDate) {
+      const d = daysUntil(s.nextChargeDate);
+      if (d != null && d >= 0 && d <= maxLead) {
+        push({ id: `renewal:${s.id}:${s.nextChargeDate}`, subId: s.id, type: 'renewal',
+          days: d, severity: d <= minLead ? 'due' : 'soon',
+          title: `${name} renews ${whenLabel(d)}`, detail: amt });
+      } else if (d != null && d < 0 && d >= -REMINDER_OVERDUE_GRACE && s.autoRenews) {
+        push({ id: `renewal-passed:${s.id}:${s.nextChargeDate}`, subId: s.id, type: 'renewal',
+          days: d, severity: 'overdue',
+          title: `${name} renewal date has passed`, detail: 'Update the next charge date to keep totals accurate.' });
+      }
+    }
+
+    // Cancel-by deadline (active + a notice period)
+    if (s.status === 'active' && s.nextChargeDate && (s.noticeDays || 0) > 0) {
+      const d = daysUntil(s.nextChargeDate);
+      if (d != null) {
+        const deadline = d - s.noticeDays;   // days until the cancel-by date
+        if (deadline <= 7 && deadline >= -2) {
+          push({ id: `notice:${s.id}:${s.nextChargeDate}`, subId: s.id, type: 'notice',
+            days: deadline, severity: deadline <= 1 ? 'due' : 'soon',
+            title: deadline < 0
+              ? `${name}: cancel-by date has passed`
+              : `${name}: cancel within ${deadline}d to avoid the charge`,
+            detail: `Needs ${s.noticeDays}d notice before the ${amt} charge.` });
+        }
+      }
+    }
+
+    // Trial ending
+    if (s.status === 'trial' && s.nextChargeDate) {
+      const d = daysUntil(s.nextChargeDate);
+      if (d != null && d >= 0 && d <= Math.max(maxLead, 7)) {
+        push({ id: `trial:${s.id}:${s.nextChargeDate}`, subId: s.id, type: 'trial',
+          days: d, severity: d <= minLead ? 'due' : 'soon',
+          title: `${name} trial ends ${whenLabel(d)}`, detail: `Then bills ${amt}. Cancel before to avoid it.` });
+      } else if (d != null && d < 0 && d >= -REMINDER_OVERDUE_GRACE) {
+        push({ id: `trial-passed:${s.id}:${s.nextChargeDate}`, subId: s.id, type: 'trial',
+          days: d, severity: 'overdue',
+          title: `${name} trial period has ended`, detail: 'Update its status if it converted to a paid plan.' });
+      }
+    }
+
+    // Recent price increase (any status)
+    const inc = recentIncrease(s, 90);
+    if (inc) {
+      push({ id: `increase:${s.id}:${inc.date}`, subId: s.id, type: 'increase',
+        days: null, severity: 'info',
+        title: `${name} price went up`,
+        detail: `${formatMoney(inc.from, s.currency)} → ${formatMoney(inc.to, s.currency)} (+${inc.pct.toFixed(0)}%)` });
+    }
+  }
+
+  const rank = { overdue: 0, due: 1, soon: 2, info: 3 };
+  out.sort((a, b) => (rank[a.severity] - rank[b.severity]) || ((a.days ?? 999) - (b.days ?? 999)));
+  return out;
+}
+
+function dismissReminder(id) {
+  App.data.dismissedReminders = App.data.dismissedReminders || {};
+  App.data.dismissedReminders[id] = new Date().toISOString().slice(0, 10);
+  markDirty();
+  renderRemindersList();
+  renderRemindersBadge();
+  if (!Auth.isGuest()) pushToWorker();
+}
+
+// Browser notification for due/overdue items — once per day, only if enabled
+// and permitted. Surfaced when the app is opened (no background push).
+function maybeNotify() {
+  if (!App.data.settings.notifyBrowser) return;
+  if (typeof Notification === 'undefined' || Notification.permission !== 'granted') return;
+  const today = new Date().toISOString().slice(0, 10);
+  if (App.data.lastNotifyDate === today) return;
+  const due = computeReminders().filter(r => r.severity === 'due' || r.severity === 'overdue');
+  if (!due.length) return;
+  App.data.lastNotifyDate = today; saveLocal();
+  const title = due.length === 1 ? 'Rivulet reminder' : `Rivulet · ${due.length} reminders`;
+  const body  = due.length === 1 ? due[0].title : due.slice(0, 3).map(r => r.title).join('\n');
+  try {
+    const n = new Notification(title, { body, tag: 'rivulet-reminders' });
+    n.onclick = () => { window.focus(); openReminders(); n.close(); };
+  } catch {}
+}
+
+// ─── Worker sync ──────────────────────────────────────────────────
+function getWorkerUrl() { return App.data?.workerUrl || ''; }
+
+async function pushToWorker() {
+  const base = getWorkerUrl().replace(/\/+$/, '');
+  if (!base) return false;
+  const token = App.data?.userToken;
+  if (!token) return false;
+  const body = JSON.stringify(App.data);
+  const headers = await Auth._authHeaders('PUT', token, body);
+  try {
+    const res = await fetch(`${base}/storage/${encodeURIComponent(token)}/profile`, {
+      method: 'PUT', headers: { 'Content-Type': 'application/json', ...headers }, body,
+    });
+    if (res.ok) {
+      App.data.pendingSync = false;
+      App.data.lastSyncTime = Date.now();
+      saveLocal(); updateSyncIndicator();
+    } else { console.error(`[Rivulet] pushToWorker failed (${res.status})`); }
+    return res.ok;
+  } catch (e) { console.error('[Rivulet] pushToWorker network error:', e); return false; }
+}
+
+async function pullFromWorker() {
+  const base = getWorkerUrl().replace(/\/+$/, '');
+  if (!base) return null;
+  const token = App.data?.userToken;
+  if (!token) return null;
+  const headers = await Auth._authHeaders('GET', token, '');
+  try {
+    const res = await fetch(`${base}/storage/${encodeURIComponent(token)}/profile`, { headers });
+    if (res.status === 410) { App.data.authMethod = 'google'; saveLocal(); return null; }
+    const migratedTo = res.headers.get('X-Token-Migrated');
+    if (migratedTo) {
+      const j = await res.json(); const remote = j.value ?? j;
+      App.data = Auth.handlePullMigration(migratedTo, mergeData(remote));
+      saveLocal(); return remote;
+    }
+    if (!res.ok) return null;
+    const j = await res.json(); return j.value ?? j;
+  } catch { return null; }
+}
+
+function shouldSync() {
+  if (Auth.isGuest() || !getWorkerUrl() || !App.data.pendingSync) return false;
+  return (Date.now() - (App.data.lastSyncTime || 0)) >= SYNC_THRESHOLD_MS;
+}
+async function maybeSync() { if (shouldSync()) await pushToWorker(); }
+function startSyncPing() {
+  if (App.syncCheckTimer) clearInterval(App.syncCheckTimer);
+  App.syncCheckTimer = setInterval(maybeSync, SYNC_CHECK_INTERVAL_MS);
+}
+function bestEffortPushOnHide() {
+  if (Auth.isGuest() || !getWorkerUrl() || !App.data.pendingSync) return;
+  pushToWorker();
+}
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') bestEffortPushOnHide(); });
+window.addEventListener('beforeunload', bestEffortPushOnHide);
+
+// merge two record arrays by id, newest updatedAt wins
+function mergeById(remoteArr, localArr) {
+  const byId = new Map();
+  (remoteArr || []).forEach(r => { if (r && r.id != null) byId.set(r.id, r); });
+  (localArr  || []).forEach(l => {
+    if (!l || l.id == null) return;
+    const r = byId.get(l.id);
+    if (!r || (l.updatedAt || 0) >= (r.updatedAt || 0)) byId.set(l.id, l);
+  });
+  return [...byId.values()];
+}
+
+// ─── Auth callbacks ───────────────────────────────────────────────
+async function onSignedIn(data, isNew) {
+  App.data = mergeData(data); saveLocal(); renderApp();
+  toast(isNew ? 'Welcome to Rivulet 🌊' : 'Welcome back — syncing your streams…');
+  pushToWorker();
+}
+async function onGuestReady(data) { App.data = mergeData(data); saveLocal(); renderApp(); }
+
+async function fetchGoogleClientId() {
+  const base = getWorkerUrl().replace(/\/+$/, '');
+  if (!base) return '';
+  try {
+    const res = await fetch(`${base}/auth/config`);
+    if (!res.ok) return '';
+    const data = await res.json();
+    return data.googleClientId || '';
+  } catch { return ''; }
+}
+
+// ─── Motion helpers ───────────────────────────────────────────────
+function prefersReducedMotion() {
+  return !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+}
+
+// Tween a number into el (e.g. the flow total) from its last shown value.
+// First paint counts up from 0; later changes ease from the previous value.
+function animateNumber(el, to, fmt, dur = 600) {
+  const from = (typeof el._rivVal === 'number') ? el._rivVal : 0;
+  el._rivVal = to;
+  if (prefersReducedMotion() || from === to || typeof requestAnimationFrame === 'undefined') {
+    el.textContent = fmt(to); return;
+  }
+  const start = (typeof performance !== 'undefined' ? performance.now() : Date.now());
+  (function tick(now) {
+    const t = Math.min(1, ((now || Date.now()) - start) / dur);
+    const eased = 1 - Math.pow(1 - t, 3);           // easeOutCubic
+    el.textContent = fmt(from + (to - from) * eased);
+    if (t < 1) requestAnimationFrame(tick); else el.textContent = fmt(to);
+  })(start);
+}
+
+// Tag freshly-rendered rows so CSS rises them into place, with a capped stagger.
+function markEntering(container) {
+  if (prefersReducedMotion()) return;
+  const rows = container.children;
+  for (let i = 0; i < rows.length; i++) {
+    rows[i].classList.add('riv-enter');
+    rows[i].style.animationDelay = `${Math.min(i, 12) * 28}ms`;
+  }
+}
+
+// ─── CSV import ───────────────────────────────────────────────────
+// Column order for the downloadable template. Mirrors the data model and
+// includes emailAlert (default no) ahead of the email feature.
+const CSV_COLUMNS = ['name', 'amount', 'currency', 'frequency', 'category',
+  'nextChargeDate', 'status', 'paymentLabel', 'lastUsedDate', 'noticeDays',
+  'taxIncluded', 'autoRenews', 'emailAlert', 'notes'];
+
+function csvCell(v) {
+  v = String(v == null ? '' : v);
+  return /[",\r\n]/.test(v) ? '"' + v.replace(/"/g, '""') + '"' : v;
+}
+
+function csvTemplate() {
+  const examples = [
+    ['Netflix', '15.49', 'USD', 'monthly', 'Entertainment', '2026-07-15', 'active', 'Visa **4421', '2026-06-22', '0', 'yes', 'yes', 'no', 'Standard plan'],
+    ['Adobe Creative Cloud', '59.99', 'USD', 'monthly', 'Development', '2026-07-02', 'active', 'Amex **11521', '', '30', 'yes', 'yes', 'yes', '30-day cancellation notice required'],
+  ];
+  return [CSV_COLUMNS, ...examples].map(r => r.map(csvCell).join(',')).join('\r\n') + '\r\n';
+}
+
+// Minimal RFC-4180-ish parser: quoted fields, escaped "" quotes, commas and
+// newlines inside quotes, CRLF or LF, leading BOM tolerated.
+function parseCSV(text) {
+  const rows = []; let row = [], field = '', inQ = false;
+  text = text.replace(/^\uFEFF/, '');
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (inQ) {
+      if (c === '"') { if (text[i + 1] === '"') { field += '"'; i++; } else inQ = false; }
+      else field += c;
+    } else if (c === '"') { inQ = true; }
+    else if (c === ',') { row.push(field); field = ''; }
+    else if (c === '\r') { /* ignore */ }
+    else if (c === '\n') { row.push(field); rows.push(row); row = []; field = ''; }
+    else field += c;
+  }
+  if (field.length || row.length) { row.push(field); rows.push(row); }
+  return rows;
+}
+
+function validDateStr(s) { return /^\d{4}-\d{2}-\d{2}$/.test(s) && parseDate(s) ? s : ''; }
+
+function importCSV(text) {
+  const rows = parseCSV(text).filter(r => r.some(c => c.trim() !== ''));
+  if (!rows.length) return { added: 0, skipped: 0, errors: ['The file looks empty.'] };
+
+  const idx = {};
+  rows[0].forEach((h, i) => { idx[h.trim().toLowerCase()] = i; });
+  if (idx['name'] == null || idx['amount'] == null) {
+    return { added: 0, skipped: 0, errors: ['Missing a "name" or "amount" column. Please use the template.'] };
+  }
+
+  const get = (cols, key) => { const i = idx[key.toLowerCase()]; return i == null ? '' : String(cols[i] ?? '').trim(); };
+  const has = key => idx[key.toLowerCase()] != null;
+  const yes = v => /^(y|yes|true|1)$/i.test(v);
+  const validFreq = FREQUENCIES.map(f => f.id);
+  const validStatus = STATUSES.map(s => s.id);
+  const catLookup = {}; CATEGORIES.forEach(c => catLookup[c.toLowerCase()] = c);
+
+  let added = 0, skipped = 0; const errors = [];
+  for (let r = 1; r < rows.length; r++) {
+    const cols = rows[r];
+    const name = get(cols, 'name');
+    const amount = parseFloat(get(cols, 'amount'));
+    if (!name) { skipped++; errors.push(`Row ${r + 1}: no name — skipped.`); continue; }
+    if (isNaN(amount) || amount < 0) { skipped++; errors.push(`Row ${r + 1} (${name}): amount isn't a valid number — skipped.`); continue; }
+
+    const sub = newSubscription();
+    sub.name = name;
+    sub.amount = amount;
+    const cur = get(cols, 'currency').toUpperCase();
+    sub.currency = CURRENCIES.includes(cur) ? cur : (App.data.settings.currency || 'USD');
+    const fr = get(cols, 'frequency').toLowerCase();
+    sub.frequency = validFreq.includes(fr) ? fr : 'monthly';
+    sub.category = catLookup[get(cols, 'category').toLowerCase()] || 'Other';
+    sub.nextChargeDate = validDateStr(get(cols, 'nextChargeDate'));
+    const st = get(cols, 'status').toLowerCase();
+    sub.status = validStatus.includes(st) ? st : 'active';
+    sub.paymentLabel = get(cols, 'paymentLabel');
+    sub.lastUsedDate = validDateStr(get(cols, 'lastUsedDate'));
+    sub.noticeDays = Math.max(0, parseInt(get(cols, 'noticeDays'), 10) || 0);
+    const tax = get(cols, 'taxIncluded');
+    sub.taxIncluded = has('taxIncluded') && tax !== '' ? yes(tax) : true;
+    const ar = get(cols, 'autoRenews');
+    sub.autoRenews = has('autoRenews') && ar !== '' ? yes(ar) : true;
+    sub.emailAlert = yes(get(cols, 'emailAlert'));   // defaults no when blank/missing
+    sub.notes = get(cols, 'notes');
+    sub.priceHistory = [{ date: new Date().toISOString().slice(0, 10), amount, note: 'Imported' }];
+    App.data.subscriptions.push(sub);
+    added++;
+  }
+  return { added, skipped, errors };
+}
+
+function downloadTemplate() {
+  const blob = new Blob([csvTemplate()], { type: 'text/csv;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = 'rivulet-import-template.csv';
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 0);
+}
+
+function openImport() { $('#import-result').innerHTML = ''; $('#import-file').value = ''; openModal('modal-import'); }
+
+async function handleImportFile(file) {
+  if (!file) return;
+  let text;
+  try { text = await file.text(); }
+  catch { $('#import-result').innerHTML = `<p class="import-warn">Couldn't read that file.</p>`; return; }
+
+  const res = importCSV(text);
+  if (res.added) { markDirty(); renderApp(); if (!Auth.isGuest()) pushToWorker(); }
+
+  const out = $('#import-result');
+  let html = '';
+  if (res.added) html += `<p class="import-ok">Imported ${res.added} ${res.added === 1 ? 'stream' : 'streams'} 🌊</p>`;
+  if (res.skipped) html += `<p class="import-warn">Skipped ${res.skipped} ${res.skipped === 1 ? 'row' : 'rows'}.</p>`;
+  if (res.errors.length) {
+    const shown = res.errors.slice(0, 8).map(e => `<li>${esc(e)}</li>`).join('');
+    const more = res.errors.length > 8 ? `<li>…and ${res.errors.length - 8} more</li>` : '';
+    html += `<ul class="import-errors">${shown}${more}</ul>`;
+  }
+  if (!html) html = `<p class="import-warn">No rows found to import.</p>`;
+  out.innerHTML = html;
+  $('#import-file').value = '';   // allow re-importing the same filename
+
+  if (res.added && !res.skipped && !res.errors.length) {
+    toast(`Imported ${res.added} ${res.added === 1 ? 'stream' : 'streams'} 🌊`);
+    setTimeout(() => closeModal('modal-import'), 1300);
+  }
+}
+
+// ─── Quick-add templates ──────────────────────────────────────────
+// Popular services with approximate US monthly prices — a starting point the
+// user adjusts. Alphabetical for findability in the dropdown.
+const QUICK_TEMPLATES = [
+  { name: '1Password', category: 'Security', amount: 2.99, frequency: 'monthly' },
+  { name: 'Adobe Creative Cloud', category: 'Development', amount: 59.99, frequency: 'monthly' },
+  { name: 'Adobe Photography Plan', category: 'Development', amount: 9.99, frequency: 'monthly' },
+  { name: 'Amazon Prime', category: 'Shopping', amount: 14.99, frequency: 'monthly' },
+  { name: 'Apple Fitness+', category: 'Fitness', amount: 9.99, frequency: 'monthly' },
+  { name: 'Apple Music', category: 'Music', amount: 10.99, frequency: 'monthly' },
+  { name: 'Apple TV+', category: 'Entertainment', amount: 9.99, frequency: 'monthly' },
+  { name: 'Audible', category: 'Entertainment', amount: 14.95, frequency: 'monthly' },
+  { name: 'Calm', category: 'Health', amount: 14.99, frequency: 'monthly' },
+  { name: 'Canva Pro', category: 'Productivity', amount: 14.99, frequency: 'monthly' },
+  { name: 'ChatGPT Plus', category: 'Productivity', amount: 20, frequency: 'monthly' },
+  { name: 'Claude Pro', category: 'Productivity', amount: 20, frequency: 'monthly' },
+  { name: 'Crunchyroll', category: 'Entertainment', amount: 7.99, frequency: 'monthly' },
+  { name: 'Disney+', category: 'Entertainment', amount: 15.99, frequency: 'monthly' },
+  { name: 'Dropbox Plus', category: 'Cloud', amount: 11.99, frequency: 'monthly' },
+  { name: 'ESPN+', category: 'Entertainment', amount: 11.99, frequency: 'monthly' },
+  { name: 'ExpressVPN', category: 'Security', amount: 12.95, frequency: 'monthly' },
+  { name: 'GitHub Pro', category: 'Development', amount: 4, frequency: 'monthly' },
+  { name: 'Google One', category: 'Cloud', amount: 1.99, frequency: 'monthly' },
+  { name: 'Grammarly Premium', category: 'Productivity', amount: 12, frequency: 'monthly' },
+  { name: 'HBO Max', category: 'Entertainment', amount: 16.99, frequency: 'monthly' },
+  { name: 'Headspace', category: 'Health', amount: 12.99, frequency: 'monthly' },
+  { name: 'Hulu', category: 'Entertainment', amount: 18.99, frequency: 'monthly' },
+  { name: 'iCloud+', category: 'Cloud', amount: 2.99, frequency: 'monthly' },
+  { name: 'Microsoft 365', category: 'Productivity', amount: 9.99, frequency: 'monthly' },
+  { name: 'Netflix', category: 'Entertainment', amount: 17.99, frequency: 'monthly' },
+  { name: 'Nintendo Switch Online', category: 'Gaming', amount: 3.99, frequency: 'monthly' },
+  { name: 'NordVPN', category: 'Security', amount: 12.99, frequency: 'monthly' },
+  { name: 'Notion Plus', category: 'Productivity', amount: 10, frequency: 'monthly' },
+  { name: 'NYTimes', category: 'News', amount: 17, frequency: 'monthly' },
+  { name: 'Paramount+', category: 'Entertainment', amount: 12.99, frequency: 'monthly' },
+  { name: 'Peacock Premium', category: 'Entertainment', amount: 7.99, frequency: 'monthly' },
+  { name: 'PlayStation Plus', category: 'Gaming', amount: 10.99, frequency: 'monthly' },
+  { name: 'Spotify Premium', category: 'Music', amount: 11.99, frequency: 'monthly' },
+  { name: 'Strava', category: 'Fitness', amount: 11.99, frequency: 'monthly' },
+  { name: 'The Athletic', category: 'News', amount: 7.99, frequency: 'monthly' },
+  { name: 'Tidal', category: 'Music', amount: 10.99, frequency: 'monthly' },
+  { name: 'Walmart+', category: 'Shopping', amount: 12.95, frequency: 'monthly' },
+  { name: 'WSJ', category: 'News', amount: 38.99, frequency: 'monthly' },
+  { name: 'Xbox Game Pass Ultimate', category: 'Gaming', amount: 19.99, frequency: 'monthly' },
+  { name: 'YouTube Premium', category: 'Entertainment', amount: 13.99, frequency: 'monthly' },
+  { name: 'YouTube TV', category: 'Entertainment', amount: 82.99, frequency: 'monthly' },
+  { name: 'Zoom Pro', category: 'Communication', amount: 14.99, frequency: 'monthly' },
+];
+
+function applyTemplate(i) {
+  const t = QUICK_TEMPLATES[i];
+  if (!t) return;
+  $('#sub-name').value = t.name;
+  $('#sub-amount').value = t.amount;
+  $('#sub-frequency').value = t.frequency;
+  $('#sub-category').value = t.category;
+}
+
+// ─── Rendering ────────────────────────────────────────────────────
+// ─── Theme ────────────────────────────────────────────────────────
+// Light/dark only. The choice lives in settings.theme; applying it just
+// toggles data-theme on <html> and every color (token-driven) follows.
+// An inline <head> script sets it pre-paint to avoid a flash; this keeps
+// the attribute and the toggle's label in sync on each render.
+function applyTheme() {
+  const dark = App.data?.settings?.theme === 'dark';
+  document.documentElement.setAttribute('data-theme', dark ? 'dark' : 'light');
+  const btn = $('#btn-theme');
+  if (btn) {
+    const label = dark ? 'Switch to light mode' : 'Switch to dark mode';
+    btn.title = label;
+    btn.setAttribute('aria-label', label);
+  }
+}
+
+function toggleTheme() {
+  App.data.settings.theme = App.data.settings.theme === 'dark' ? 'light' : 'dark';
+  applyTheme();
+  markDirty();
+}
+
+function renderApp() {
+  applyTheme();
+  const subs = App.data.subscriptions;
+  const has = subs.length > 0;
+
+  $('#empty-state').hidden = has;
+  $('#hero').hidden = !has;
+  $('#streams-section').hidden = !has;
+
+  renderRemindersBadge();
+
+  if (!has) {
+    $('#upcoming-section').hidden = true;
+    $('#projection-section').hidden = true;
+    $('#installments-section').hidden = true;
+    return;
+  }
+
+  renderHero();
+  renderProjection();
+  renderUpcoming();
+  renderInstallments();
+  renderStreams();
+}
+
+// ─── Reminders UI ─────────────────────────────────────────────────
+function renderRemindersBadge() {
+  const n = computeReminders().length;
+  const badge = $('#reminders-badge');
+  if (!badge) return;
+  badge.textContent = n > 9 ? '9+' : String(n);
+  badge.style.display = n ? '' : 'none';
+}
+
+function openReminders() {
+  renderRemindersList();
+  openModal('modal-reminders');
+}
+
+function renderRemindersList() {
+  const list = $('#reminders-list');
+  if (!list) return;
+  const items = computeReminders();
+  if (!items.length) {
+    list.innerHTML = `<p class="muted" style="padding:1.5rem 0;text-align:center;">You're all caught up — no reminders right now. 🌊</p>`;
+    return;
+  }
+  list.innerHTML = items.map(r => `
+    <div class="reminder-row sev-${r.severity}">
+      <div class="reminder-body" data-sub="${esc(r.subId)}" role="button" tabindex="0">
+        <div class="reminder-title">${esc(r.title)}</div>
+        <div class="reminder-detail">${esc(r.detail)}</div>
+      </div>
+      <button class="btn btn-ghost btn-sm reminder-dismiss" data-id="${esc(r.id)}">Dismiss</button>
+    </div>`).join('');
+
+  $$('#reminders-list .reminder-body').forEach(body => {
+    const open = () => { closeModal('modal-reminders'); openSubModal(body.dataset.sub); };
+    body.addEventListener('click', open);
+    body.addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); open(); } });
+  });
+  $$('#reminders-list .reminder-dismiss').forEach(b =>
+    b.addEventListener('click', e => { e.stopPropagation(); dismissReminder(b.dataset.id); }));
+
+  markEntering(list);
+}
+
+function renderHero() {
+  const period = App.data.settings.flowView;
+  const annual = period === 'annual';
+  $$('.flow-toggle-btn').forEach(b => b.classList.toggle('is-active', b.dataset.period === period));
+  $$('.view-toggle-btn').forEach(b => b.classList.toggle('is-active', b.dataset.view === App.heroView));
+  $('#hero').classList.toggle('view-category', App.heroView === 'category');
+
+  const cat = App.heroView === 'category' ? App.categoryFilter : null;
+  const baseMonthly = cat ? categoryMonthly(cat) : activeMonthlyTotal();
+  const shown = annual ? baseMonthly * 12 : baseMonthly;
+  animateNumber($('#flow-amount'), shown, formatMoney);
+
+  // Capacity color cue — only on the global flow figure. When a category is
+  // selected the number is that category's total, so the overall ceiling
+  // doesn't apply.
+  const flowEl = $('#flow-amount');
+  flowEl.classList.remove('cap-ok', 'cap-near', 'cap-over');
+  const band = cat ? null : capacityBand();
+  if (band) flowEl.classList.add('cap-' + band);
+
+  // Eyebrow names the current scope so the big number is never ambiguous.
+  $('#hero-eyebrow').textContent = cat
+    ? `${cat} · ${annual ? 'annual' : 'monthly'} flow`
+    : `${annual ? 'Annual' : 'Monthly'} flow`;
+
+  $('#flow-substats').innerHTML = cat ? categorySubstats(cat, annual) : globalSubstats(annual);
+
+  // Clear button only when a category is selected.
+  const clearBtn = $('#cat-clear');
+  if (clearBtn) clearBtn.style.display = cat ? '' : 'none';
+
+  if (App.heroView === 'category') renderCategoryBars(annual);
+  else renderStreamBars();
+}
+
+function globalSubstats(annual) {
+  const subs = App.data.subscriptions;
+  const monthlyTotal = activeMonthlyTotal();
+  const activeCount = subs.filter(isActive).length;
+  const renewWeek = subs.filter(isActive).filter(s => { const d = daysUntil(s.nextChargeDate); return d != null && d >= 0 && d <= 7; }).length;
+  const trials = subs.filter(s => s.status === 'trial').length;
+  const leaks = subs.filter(isLeak).length;
+  const reclaim = leakMonthly();
+  const increases = subs.filter(s => recentIncrease(s, 90)).length;
+  const plans = activeInstallments().length;
+  const other = annual ? `${formatMoney(monthlyTotal)}/mo` : `${formatMoney(monthlyTotal * 12)}/year`;
+
+  const bits = [
+    `<b>${other.split('/')[0]}</b>/${other.split('/')[1]}`,
+    `<b>${activeCount}</b> active ${activeCount === 1 ? 'stream' : 'streams'}`,
+  ];
+  if (plans) bits.push(`<span class="plan-stat"><b>${plans}</b> payment ${plans === 1 ? 'plan' : 'plans'}</span>`);
+  const ratio = capacityRatio();
+  if (ratio != null) {
+    const pct  = Math.round(ratio * 100);
+    const gapM = activeMonthlyTotal() - capacityMonthly();       // monthly $ over/under
+    const gap  = formatMoney(Math.abs(annual ? gapM * 12 : gapM));
+    const band = capacityBand(ratio);                            // ok | near | over
+    const tail = ratio > 1 ? `${gap} over` : `${gap} left`;
+    bits.push(`<span class="cap-stat cap-stat-${band}"><b>${pct}%</b> of capacity · ${tail}</span>`);
+  }
+  if (renewWeek) bits.push(`<b>${renewWeek}</b> renew this week`);
+  if (trials)    bits.push(`<b>${trials}</b> ${trials === 1 ? 'trial' : 'trials'}`);
+  if (increases) bits.push(`<span class="leak-stat">${increases} price ${increases === 1 ? 'rise' : 'rises'}</span>`);
+  if (leaks)     bits.push(`<span class="leak-stat">${leaks} ${leaks === 1 ? 'leak' : 'leaks'}${reclaim > 0 ? ` · reclaim ${formatMoney(reclaim)}/mo` : ''}</span>`);
+  if (hasMixedCurrencies()) bits.push(`<span class="fx-note" title="Streams in other currencies are converted to ${displayCurrency()} at approximate rates.">≈ ${displayCurrency()}, approx FX</span>`);
+  return bits.join(' · ');
+}
+
+function categorySubstats(cat, annual) {
+  const inCat = App.data.subscriptions.filter(s => isActive(s) && s.category === cat);
+  const total = activeMonthlyTotal();
+  const catMonthly = categoryMonthly(cat);
+  const share = total > 0 ? Math.round((catMonthly / total) * 100) : 0;
+  const leaks = App.data.subscriptions.filter(s => isLeak(s) && s.category === cat).length;
+  const bits = [
+    `<b>${inCat.length}</b> ${inCat.length === 1 ? 'stream' : 'streams'} in ${esc(cat)}`,
+    `<b>${share}%</b> of your flow`,
+  ];
+  if (leaks) bits.push(`<span class="leak-stat">${leaks} ${leaks === 1 ? 'leak' : 'leaks'}</span>`);
+  return bits.join(' · ');
+}
+
+// True for an active finite installment plan (has payments remaining).
+function isFinitePlan(s) { return !!(s.isFinite && s.remainingPayments >= 1); }
+
+// Per-stream bars — widest = costliest, draining rightward. Each bar renders
+// at its target width; the riv-fill keyframe sweeps it in from 0 on creation,
+// so this replays on every hero render. Disabled under reduced-motion in CSS.
+// Finite payment plans are flagged with a badge + tinted bar so they read as
+// temporary drains at a glance.
+function renderStreamBars() {
+  const ranked = App.data.subscriptions.filter(isActive)
+    .map(s => ({ s, m: normMonthly(s) })).sort((a, b) => b.m - a.m).slice(0, 8);
+  const max = ranked.length ? ranked[0].m : 1;
+  $('#flow-streams').innerHTML = ranked.map(({ s, m }) => {
+    const plan = isFinitePlan(s);
+    const badge = plan ? `<span class="plan-badge" title="Payment plan — ${s.remainingPayments} left">plan</span>` : '';
+    return `
+    <div class="stream-bar-row${plan ? ' is-plan' : ''}">
+      <span class="stream-bar-name">${badge}${esc(s.name || 'Untitled')}</span>
+      <div class="stream-bar-track">
+        <div class="stream-bar-fill" style="width:${Math.max(6, (m / max) * 100).toFixed(2)}%;"></div>
+      </div>
+      <span class="stream-bar-amt">${formatMoney(m)}</span>
+    </div>`;
+  }).join('');
+}
+
+// Per-category bars — each a tributary; click to scope the hero + filter the
+// list. Used categories only, top 10 by spend.
+function renderCategoryBars(annual) {
+  const cats = usedCategories().slice(0, 10);
+  const container = $('#flow-streams');
+  if (!cats.length) {
+    container.innerHTML = `<p class="muted f13" style="padding:.4rem 0;">No active streams to break down yet.</p>`;
+    return;
+  }
+  const max = cats[0].total || 1;
+  container.innerHTML = cats.map(({ category, total }) => {
+    const amt = formatMoney(annual ? total * 12 : total);
+    const sel = App.categoryFilter === category;
+    return `
+    <div class="stream-bar-row cat-bar-row ${sel ? 'is-selected' : ''}" data-cat="${esc(category)}" role="button" tabindex="0" aria-pressed="${sel}">
+      <span class="stream-bar-name">${esc(category)}</span>
+      <div class="stream-bar-track">
+        <div class="stream-bar-fill" style="width:${Math.max(6, (total / max) * 100).toFixed(2)}%;"></div>
+      </div>
+      <span class="stream-bar-amt">${amt}</span>
+    </div>`;
+  }).join('');
+
+  $$('#flow-streams .cat-bar-row').forEach(row => {
+    const pick = () => selectCategory(row.dataset.cat);
+    row.addEventListener('click', pick);
+    row.addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); pick(); } });
+  });
+}
+
+// Toggle a category scope on/off, then re-render hero + list.
+function selectCategory(cat) {
+  App.categoryFilter = (App.categoryFilter === cat) ? null : cat;
+  renderHero();
+  renderStreams();
+}
+
+function renderUpcoming() {
+  const upcoming = App.data.subscriptions
+    .filter(isActive)
+    .map(s => ({ s, days: daysUntil(s.nextChargeDate) }))
+    .filter(x => x.days != null && x.days >= 0 && x.days <= 30)
+    .sort((a, b) => a.days - b.days);
+
+  const section = $('#upcoming-section');
+  if (!upcoming.length) { section.hidden = true; return; }
+  section.hidden = false;
+
+  const total = upcoming.reduce((sum, x) => sum + convertAmount(x.s.amount, x.s.currency, displayCurrency()), 0);
+  $('#upcoming-total').textContent = formatMoney(total);
+
+  $('#upcoming-list').innerHTML = upcoming.map(({ s, days }) => {
+    const d = parseDate(s.nextChargeDate);
+    const day = d.getDate();
+    const mon = d.toLocaleString(undefined, { month: 'short' });
+    const soon = days <= 7;
+    return `
+      <li class="upcoming-row">
+        <span class="upcoming-date"><span class="d">${day}</span><span class="m">${mon}</span></span>
+        <span><span class="upcoming-name">${esc(s.name || 'Untitled')}</span><br>
+          <span class="upcoming-when ${soon ? 'soon' : ''}">${whenLabel(days)}</span></span>
+        <span class="upcoming-amt">${formatMoney(s.amount, s.currency)}</span>
+      </li>`;
+  }).join('');
+
+  markEntering($('#upcoming-list'));
+}
+
+// ─── Installments (finite payment plans) ──────────────────────────
+// A summary of active finite streams: what's still owed in total, and the
+// "relief" — how much monthly flow returns as each plan finishes. This is
+// insight a flat list can't show: a finite plan is a drain with a known end.
+function activeInstallments() {
+  return App.data.subscriptions
+    .filter(s => isActive(s) && s.isFinite && s.remainingPayments >= 1)
+    .map(s => ({
+      s,
+      end: finiteEndDate(s),
+      owed: convertAmount((Number(s.amount) || 0) * s.remainingPayments, s.currency, displayCurrency()),
+      relief: normMonthly(s),   // monthly flow that returns when this plan ends
+    }))
+    .sort((a, b) => {
+      if (!a.end) return 1; if (!b.end) return -1;
+      return a.end - b.end;   // soonest to finish first
+    });
+}
+
+function renderInstallments() {
+  const section = $('#installments-section');
+  if (!section) return;
+  const plans = activeInstallments();
+  if (!plans.length) { section.hidden = true; return; }
+  section.hidden = false;
+
+  const totalOwed = plans.reduce((sum, p) => sum + p.owed, 0);
+  $('#installments-total').textContent = `${formatMoney(totalOwed)} owed`;
+
+  // Relief headline — lead with the soonest plan to finish, since that relief
+  // arrives first. Fall back gracefully if a plan is missing an end date.
+  const next = plans.find(p => p.end);
+  const relief = $('#installments-relief');
+  if (next) {
+    const when = next.end.toLocaleDateString(undefined, { month: 'long', year: 'numeric' });
+    const monthlyRelief = plans
+      .filter(p => p.end && sameMonth(p.end, next.end))
+      .reduce((sum, p) => sum + p.relief, 0);
+    const more = plans.length > 1
+      ? ` · ${formatMoney(totalReliefMonthly(plans))}/mo returns once all ${plans.length} finish`
+      : '';
+    relief.innerHTML = `Your flow drops by <b>${formatMoney(monthlyRelief)}/mo</b> after ${when}${more}`;
+  } else {
+    relief.textContent = '';
+  }
+
+  $('#installments-list').innerHTML = plans.map(({ s, end, owed }) => {
+    const f = freqOf(s.frequency);
+    const n = s.remainingPayments;
+    const left = n === 1 ? 'last payment' : `${n} payments left`;
+    const endStr = end ? end.toLocaleDateString(undefined, { month: 'short', year: 'numeric' }) : '';
+    return `
+      <li class="installment-row" data-id="${s.id}" role="button" tabindex="0">
+        <span class="installment-main">
+          <span class="installment-name">${esc(s.name || 'Untitled')}</span>
+          <span class="installment-meta">${esc(left)}${endStr ? ` · ends ${esc(endStr)}` : ''}</span>
+        </span>
+        <span class="installment-right">
+          <span class="installment-amt">${formatMoney(s.amount, s.currency)}<span class="per">/${f.per}</span></span>
+          <span class="installment-owed">${formatMoney(owed)} left</span>
+        </span>
+      </li>`;
+  }).join('');
+
+  $$('#installments-list .installment-row').forEach(row => {
+    const open = () => openSubModal(row.dataset.id);
+    row.addEventListener('click', open);
+    row.addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); open(); } });
+  });
+
+  markEntering($('#installments-list'));
+}
+
+// Total monthly flow that returns once every listed plan has finished.
+function totalReliefMonthly(plans) {
+  return plans.reduce((sum, p) => sum + p.relief, 0);
+}
+
+// True when two Dates fall in the same calendar month and year.
+function sameMonth(a, b) {
+  return a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth();
+}
+// Forecast cumulative spend over a horizon by walking each active stream's
+// charge dates forward and bucketing converted amounts by month.
+function stepDate(d, freq) {
+  const x = new Date(d);
+  switch (freq) {
+    case 'weekly':      x.setDate(x.getDate() + 7);  break;
+    case 'biweekly':    x.setDate(x.getDate() + 14); break;
+    case 'fourweekly':  x.setDate(x.getDate() + 28); break;
+    case 'quarterly':   x.setMonth(x.getMonth() + 3); break;
+    case 'yearly':      x.setFullYear(x.getFullYear() + 1); break;
+    default:            x.setMonth(x.getMonth() + 1);
+  }
+  return x;
+}
+
+// Given a finite stream's nextChargeDate + remainingPayments, return the
+// Date of the final charge, or null if the stream is not finite / missing data.
+function finiteEndDate(sub) {
+  if (!sub.isFinite || !(sub.remainingPayments >= 1) || !sub.nextChargeDate) return null;
+  let d = parseDate(sub.nextChargeDate);
+  if (!d) return null;
+  for (let i = 1; i < sub.remainingPayments; i++) d = stepDate(d, sub.frequency);
+  return d;
+}
+
+// Format a Date as YYYY-MM-DD string.
+function dateToStr(d) {
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
+// ─── Auto-advance overdue charge dates ────────────────────────────
+// On every boot, walk active/trial streams whose nextChargeDate has passed
+// and step it forward by their billing frequency until it reaches today or
+// the future. This means the app self-corrects without any user action.
+// Only streams with autoRenews:true are advanced (manually-managed streams
+// are left alone so the overdue reminder stays visible).
+//
+// Finite (installment) streams are the exception: they always advance even
+// though autoRenews is off, because an installment plan self-tracks its own
+// schedule. Each step forward consumes one payment, so remainingPayments
+// drops in lockstep. When it hits 0 the plan is complete — we stop advancing
+// and mark the stream cancelled (a finished plan is a genuine terminal state,
+// not a forgotten sub).
+function advanceOverdueDates() {
+  const today = startOfToday();
+  let changed = false;
+  for (const s of App.data.subscriptions) {
+    if (s.status !== 'active' && s.status !== 'trial') continue;
+    if (!s.nextChargeDate) continue;
+    const isFin = s.isFinite && s.remainingPayments >= 1;
+    if (!s.autoRenews && !isFin) continue;   // finite plans advance without autoRenews
+    let d = parseDate(s.nextChargeDate);
+    if (!d || d >= today) continue;   // already current
+
+    let remaining = isFin ? s.remainingPayments : null;
+    let guard = 0;
+    // Step forward one billing cycle at a time. For finite streams each step
+    // consumes a payment; stop once the plan is exhausted even if still in the
+    // past (the final charge already happened).
+    while (d < today && guard++ < 3000) {
+      if (isFin && remaining <= 1) break;   // last payment already occurred
+      d = stepDate(d, s.frequency);
+      if (isFin) remaining -= 1;
+    }
+
+    const next = dateToStr(d);
+    let rowChanged = false;
+    if (next !== s.nextChargeDate) { s.nextChargeDate = next; rowChanged = true; }
+    if (isFin && remaining !== s.remainingPayments) { s.remainingPayments = remaining; rowChanged = true; }
+
+    // Finite plan complete: the final charge date is in the past and no
+    // payments remain. Retire the stream so it stops counting toward flow.
+    if (isFin && remaining <= 1 && parseDate(s.nextChargeDate) < today) {
+      if (s.status !== 'cancelled') { s.status = 'cancelled'; rowChanged = true; }
+    }
+
+    if (rowChanged) { s.updatedAt = Date.now(); changed = true; }
+  }
+  if (changed) markDirty();
+}
+
+function chargeDatesWithin(sub, start, end) {
+  const out = [];
+  const hardEnd = sub.isFinite ? finiteEndDate(sub) : null;  // null = perpetual
+  // If the stream has already exhausted its payments, nothing to project.
+  if (hardEnd && hardEnd < start) return out;
+  const effectiveEnd = (hardEnd && hardEnd < end) ? new Date(hardEnd.getTime() + 1) : end;
+
+  let anchor = parseDate(sub.nextChargeDate) || new Date(start); // no date → from today
+  let guard = 0;
+  while (anchor < start && guard++ < 3000) anchor = stepDate(anchor, sub.frequency);
+  let d = new Date(anchor); guard = 0;
+  while (d < effectiveEnd && guard++ < 3000) { out.push(new Date(d)); d = stepDate(d, sub.frequency); }
+  return out;
+}
+
+function projectSpend(months) {
+  const start = startOfToday();
+  const end = new Date(start); end.setMonth(end.getMonth() + months);
+  const disp = displayCurrency();
+  const buckets = new Array(months).fill(0);
+  for (const s of App.data.subscriptions) {
+    if (!isActive(s)) continue;
+    const amt = convertAmount(Number(s.amount) || 0, s.currency, disp);
+    if (amt <= 0) continue;
+    for (const d of chargeDatesWithin(s, start, end)) {
+      const mi = (d.getFullYear() - start.getFullYear()) * 12 + (d.getMonth() - start.getMonth());
+      if (mi >= 0 && mi < months) buckets[mi] += amt;
+    }
+  }
+  const cumulative = []; let run = 0;
+  for (let i = 0; i < months; i++) { run += buckets[i]; cumulative.push(run); }
+  return { months, buckets, cumulative, total: run, start, disp };
+}
+
+function niceCeil(v) {
+  if (v <= 0) return 1;
+  const mag = Math.pow(10, Math.floor(Math.log10(v)));
+  const n = v / mag;
+  const step = n <= 1 ? 1 : n <= 2 ? 2 : n <= 5 ? 5 : 10;
+  return step * mag;
+}
+
+function projectionSVG(p) {
+  const W = 720, H = 210, padL = 52, padR = 16, padT = 14, padB = 30;
+  const plotW = W - padL - padR, plotH = H - padT - padB;
+  const maxY = niceCeil(p.total || 1);
+  const n = p.months;
+  const xAt = i => padL + (i / n) * plotW;             // i: 0 = now … n = horizon end
+  const yAt = v => padT + plotH - (v / maxY) * plotH;
+  // points: now(0,0) then cumulative at month 1..n
+  const pts = [[0, 0], ...p.cumulative.map((v, idx) => [idx + 1, v])];
+  const line = pts.map((pt, k) => `${k ? 'L' : 'M'}${xAt(pt[0]).toFixed(1)} ${yAt(pt[1]).toFixed(1)}`).join(' ');
+  const area = `${line} L${xAt(n).toFixed(1)} ${yAt(0).toFixed(1)} L${xAt(0).toFixed(1)} ${yAt(0).toFixed(1)} Z`;
+
+  // y gridlines at 0, ½, max
+  const yTicks = [0, maxY / 2, maxY].map(v => {
+    const y = yAt(v);
+    return `<line class="chart-grid" x1="${padL}" y1="${y.toFixed(1)}" x2="${W - padR}" y2="${y.toFixed(1)}"/>
+            <text class="chart-ylabel" x="${padL - 8}" y="${(y + 3.5).toFixed(1)}" text-anchor="end">${esc(formatMoney(v))}</text>`;
+  }).join('');
+
+  // x labels — ~4 evenly spaced ticks plus "Now"
+  const ticks = 4;
+  const xLabels = Array.from({ length: ticks + 1 }, (_, k) => {
+    const i = Math.round((k / ticks) * n);
+    const dt = new Date(p.start); dt.setMonth(dt.getMonth() + i);
+    const label = i === 0 ? 'Now'
+      : (n > 12 ? dt.toLocaleString(undefined, { month: 'short', year: '2-digit' })
+                : dt.toLocaleString(undefined, { month: 'short' }));
+    return `<text class="chart-xlabel" x="${xAt(i).toFixed(1)}" y="${H - 10}" text-anchor="${k === 0 ? 'start' : k === ticks ? 'end' : 'middle'}">${esc(label)}</text>`;
+  }).join('');
+
+  const endX = xAt(n), endY = yAt(p.total);
+  return `
+  <svg viewBox="0 0 ${W} ${H}" class="proj-svg" role="img" aria-label="Projected cumulative spend">
+    <defs>
+      <linearGradient id="projGrad" x1="0" y1="0" x2="0" y2="1">
+        <stop offset="0%" stop-color="var(--flow)" stop-opacity="0.32"/>
+        <stop offset="100%" stop-color="var(--flow)" stop-opacity="0.02"/>
+      </linearGradient>
+    </defs>
+    ${yTicks}
+    <path d="${area}" fill="url(#projGrad)"/>
+    <path d="${line}" fill="none" stroke="var(--current)" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+    <circle cx="${endX.toFixed(1)}" cy="${endY.toFixed(1)}" r="4" fill="var(--current)"/>
+    ${xLabels}
+  </svg>`;
+}
+
+function renderProjection() {
+  const section = $('#projection-section');
+  if (!section) return;
+  const active = App.data.subscriptions.filter(isActive).length;
+  if (!active) { section.hidden = true; return; }
+  section.hidden = false;
+  const months = App.projMonths || 12;
+  $$('.proj-toggle-btn').forEach(b => b.classList.toggle('is-active', +b.dataset.months === months));
+  const p = projectSpend(months);
+  $('#projection-headline').innerHTML =
+    `≈ <b>${formatMoney(p.total)}</b> flows out over the next ${months} months`;
+  $('#projection-chart').innerHTML = projectionSVG(p);
+}
+
+function renderStreams(animate = true) {
+  const q = App.search.trim().toLowerCase();
+  let rows = App.data.subscriptions.slice();
+
+  if (App.categoryFilter) rows = rows.filter(s => s.category === App.categoryFilter);
+  if (App.filter !== 'all') rows = rows.filter(s => s.status === App.filter);
+  if (q) rows = rows.filter(s => (s.name + ' ' + s.category).toLowerCase().includes(q));
+
+  // Scope indicator — shows the active category and clears it on click.
+  const scope = $('#stream-scope');
+  if (scope) {
+    scope.innerHTML = App.categoryFilter
+      ? `<button class="scope-chip" title="Clear category filter">${esc(App.categoryFilter)} ✕</button>`
+      : '';
+    const chip = scope.querySelector('.scope-chip');
+    if (chip) chip.addEventListener('click', () => selectCategory(App.categoryFilter));
+  }
+
+  // active first, then by next charge proximity, then name
+  rows.sort((a, b) => {
+    if (isActive(a) !== isActive(b)) return isActive(a) ? -1 : 1;
+    const da = daysUntil(a.nextChargeDate), db = daysUntil(b.nextChargeDate);
+    if (da != null && db != null) return da - db;
+    if (da != null) return -1; if (db != null) return 1;
+    return (a.name || '').localeCompare(b.name || '');
+  });
+
+  const list = $('#streams-list');
+  if (!rows.length) {
+    list.innerHTML = `<p class="muted" style="padding:1rem 0;">No streams match.</p>`;
+    return;
+  }
+
+  list.innerHTML = rows.map(s => {
+    const f = freqOf(s.frequency);
+    const days = daysUntil(s.nextChargeDate);
+    const soon = days != null && days >= 0 && days <= 7;
+    const pills = [];
+    if (s.status === 'trial')     pills.push('<span class="pill pill-trial">Trial</span>');
+    if (s.status === 'paused')    pills.push('<span class="pill pill-paused">Paused</span>');
+    if (s.status === 'cancelled') pills.push('<span class="pill pill-cancelled">Cancelled</span>');
+    if (s.isFinite && isActive(s)) {
+      const n = s.remainingPayments;
+      const endD = finiteEndDate(s);
+      const endStr = endD ? endD.toLocaleDateString(undefined, { month: 'short', year: 'numeric' }) : '';
+      const label = n === 1 ? 'Last payment' : n >= 1 ? `${n} left` : 'Finite';
+      pills.push(`<span class="pill pill-finite" title="${endStr ? 'Ends ' + endStr : ''}">${label}</span>`);
+    }
+    if (isLeak(s))                pills.push('<span class="pill pill-leak">Leak</span>');
+
+    const next = (isActive(s) && days != null)
+      ? `<span class="stream-next ${soon ? 'soon' : ''}">${whenLabel(days)}</span>` : '';
+
+    return `
+      <div class="stream-row" data-id="${s.id}" role="button" tabindex="0">
+        <div class="stream-main">
+          <span class="stream-name">${esc(s.name || 'Untitled')}</span>
+          ${pills.join('')}
+        </div>
+        <div class="stream-meta">
+          <span class="stream-cat">${esc(s.category)}</span>
+          ${s.paymentLabel ? `<span>· ${esc(s.paymentLabel)}</span>` : ''}
+        </div>
+        <div class="stream-right">
+          <span class="stream-amt">${formatMoney(s.amount, s.currency)}<span class="per">/${f.per}</span></span>
+          ${next}
+        </div>
+      </div>`;
+  }).join('');
+
+  $$('#streams-list .stream-row').forEach(row => {
+    const open = () => openSubModal(row.dataset.id);
+    row.addEventListener('click', open);
+    row.addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); open(); } });
+  });
+
+  if (animate) markEntering(list);
+}
+
+// ─── Subscription modal (add / edit) ──────────────────────────────
+// Per-stream price history as a small line chart: segments colored by
+// direction (a rise is ember/danger, a drop is reclaimed). Hidden until
+// there are at least two recorded price points.
+function renderPriceHistory(sub) {
+  const pts = (sub.priceHistory || []).filter(p => p && typeof p.amount === 'number')
+    .slice().sort((a, b) => String(a.date || '').localeCompare(String(b.date || '')));
+  if (pts.length < 2) return '';
+  const cur = sub.currency;
+  const W = 480, H = 112, padL = 10, padR = 10, padT = 24, padB = 20;
+  const plotW = W - padL - padR, plotH = H - padT - padB;
+  const amts = pts.map(p => p.amount);
+  let lo = Math.min(...amts), hi = Math.max(...amts);
+  if (hi === lo) { hi = lo + 1; lo = Math.max(0, lo - 1); }
+  const padY = (hi - lo) * 0.15; lo -= padY; hi += padY;
+  const n = pts.length;
+  const xAt = i => padL + (n === 1 ? 0.5 : i / (n - 1)) * plotW;
+  const yAt = v => padT + plotH - ((v - lo) / (hi - lo)) * plotH;
+
+  let segs = '';
+  for (let i = 1; i < n; i++) {
+    const a = pts[i - 1].amount, b = pts[i].amount;
+    const col = b > a ? 'var(--danger)' : b < a ? 'var(--reclaimed)' : 'var(--current)';
+    segs += `<line x1="${xAt(i - 1).toFixed(1)}" y1="${yAt(a).toFixed(1)}" x2="${xAt(i).toFixed(1)}" y2="${yAt(b).toFixed(1)}" stroke="${col}" stroke-width="2.5" stroke-linecap="round"/>`;
+  }
+  const dots = pts.map((p, i) => `<circle cx="${xAt(i).toFixed(1)}" cy="${yAt(p.amount).toFixed(1)}" r="3" fill="var(--surface)" stroke="var(--current)" stroke-width="1.6"/>`).join('');
+  const first = pts[0], last = pts[n - 1];
+  const chg = pctChange(first.amount, last.amount);
+  const chgTxt = chg == null ? '' : `${chg >= 0 ? '+' : ''}${chg.toFixed(0)}%`;
+  const chgCls = chg > 0 ? 'ph-up' : chg < 0 ? 'ph-down' : 'ph-flat';
+
+  return `
+    <div class="ph-head">
+      <span class="ph-title">Price history</span>
+      <span class="ph-chg ${chgCls}">${chgTxt} since ${esc(first.date || 'start')}</span>
+    </div>
+    <svg viewBox="0 0 ${W} ${H}" class="ph-svg" role="img" aria-label="Price history">
+      <text class="ph-lbl" x="${padL}" y="13" text-anchor="start">${esc(formatMoney(first.amount, cur))}</text>
+      <text class="ph-lbl" x="${W - padR}" y="13" text-anchor="end">${esc(formatMoney(last.amount, cur))}</text>
+      ${segs}${dots}
+      <text class="ph-date" x="${padL}" y="${H - 6}" text-anchor="start">${esc(first.date || '')}</text>
+      <text class="ph-date" x="${W - padR}" y="${H - 6}" text-anchor="end">${esc(last.date || '')}</text>
+    </svg>`;
+}
+
+function fillSelect(el, items, getVal, getLabel) {
+  el.innerHTML = items.map(it => `<option value="${getVal(it)}">${getLabel(it)}</option>`).join('');
+}
+
+function openSubModal(id = null) {
+  App.editingId = id;
+  const sub = id ? App.data.subscriptions.find(s => s.id === id) : newSubscription();
+  if (!sub) return;
+
+  fillSelect($('#sub-currency'), CURRENCIES, c => c, c => c);
+  fillSelect($('#sub-frequency'), FREQUENCIES, f => f.id, f => f.label);
+  fillSelect($('#sub-category'), CATEGORIES, c => c, c => c);
+  fillSelect($('#sub-status'), STATUSES, s => s.id, s => s.label);
+
+  // Quick-fill is only useful when adding; populate fresh and hide on edit.
+  const tpl = $('#sub-template');
+  tpl.innerHTML = `<option value="">— none —</option>` +
+    QUICK_TEMPLATES.map((t, i) => `<option value="${i}">${esc(t.name)}</option>`).join('');
+  tpl.value = '';
+  $('#sub-template-group').style.display = id ? 'none' : '';
+
+  $('#sub-modal-title').textContent = id ? 'Edit stream' : 'Add stream';
+  $('#sub-name').value     = sub.name;
+  $('#sub-amount').value    = sub.amount || '';
+  $('#sub-currency').value  = sub.currency;
+  $('#sub-frequency').value = sub.frequency;
+  $('#sub-category').value  = sub.category;
+  $('#sub-next-date').value = sub.nextChargeDate;
+  $('#sub-status').value    = sub.status;
+  $('#sub-payment').value   = sub.paymentLabel;
+  $('#sub-lastused').value  = sub.lastUsedDate;
+  $('#sub-notice').value    = sub.noticeDays || '';
+  $('#sub-tax').checked      = sub.taxIncluded !== false;
+  $('#sub-autorenew').checked = !!sub.autoRenews;
+  $('#sub-notes').value     = sub.notes;
+  $('#sub-status-msg').textContent = '';
+  $('#sub-delete').style.display = id ? '' : 'none';
+
+  // Finite / installment fields
+  const isFiniteCheck = $('#sub-is-finite');
+  const finiteGroup   = $('#sub-finite-group');
+  if (isFiniteCheck && finiteGroup) {
+    isFiniteCheck.checked = !!sub.isFinite;
+    $('#sub-remaining').value = sub.remainingPayments || '';
+    finiteGroup.style.display = sub.isFinite ? '' : 'none';
+    // Reflect the finite⇄auto-renew exclusivity without clobbering a stored
+    // value: only force auto-renew when the stream is finite. Otherwise show
+    // the stream's own autoRenews (set a few lines above) and keep it editable.
+    if (sub.isFinite) { $('#sub-autorenew').checked = false; $('#sub-autorenew').disabled = true; }
+    else              { $('#sub-autorenew').disabled = false; }
+    updateFiniteEndLabel();
+  }
+
+  const ph = $('#price-history');
+  if (ph) {
+    const html = id && sub ? renderPriceHistory(sub) : '';
+    ph.innerHTML = html;
+    ph.style.display = html ? '' : 'none';
+  }
+
+  openModal('modal-sub');
+  $('#sub-name').focus();
+}
+
+function saveSubscription() {
+  const name = $('#sub-name').value.trim();
+  const amount = parseFloat($('#sub-amount').value);
+  const msg = $('#sub-status-msg');
+  if (!name)              { msg.textContent = 'Give the stream a name.'; return; }
+  if (isNaN(amount) || amount < 0) { msg.textContent = 'Enter a valid amount.'; return; }
+
+  const isFiniteChecked = !!$('#sub-is-finite')?.checked;
+  const remainingRaw = parseInt($('#sub-remaining')?.value, 10);
+  const remainingPayments = isFiniteChecked && remainingRaw >= 1 ? remainingRaw : null;
+
+  if (isFiniteChecked && !(remainingPayments >= 1)) {
+    const msg = $('#sub-status-msg');
+    msg.textContent = 'Enter how many payments remain (at least 1).';
+    return;
+  }
+
+  const fields = {
+    name, amount,
+    currency:  $('#sub-currency').value,
+    frequency: $('#sub-frequency').value,
+    category:  $('#sub-category').value,
+    nextChargeDate: $('#sub-next-date').value,
+    status:    $('#sub-status').value,
+    paymentLabel: $('#sub-payment').value.trim(),
+    lastUsedDate: $('#sub-lastused').value,
+    noticeDays: Math.max(0, parseInt($('#sub-notice').value, 10) || 0),
+    taxIncluded: $('#sub-tax').checked,
+    autoRenews: isFiniteChecked ? false : $('#sub-autorenew').checked,
+    notes: $('#sub-notes').value.trim(),
+    isFinite: isFiniteChecked,
+    remainingPayments,
+    updatedAt: Date.now(),
+  };
+
+  if (App.editingId) {
+    const sub = App.data.subscriptions.find(s => s.id === App.editingId);
+    // record a price-history point if the amount changed
+    if (sub && Number(sub.amount) !== amount) {
+      sub.priceHistory = sub.priceHistory || [];
+      sub.priceHistory.push({ date: new Date().toISOString().slice(0, 10), amount, note: '' });
+    }
+    Object.assign(sub, fields);
+  } else {
+    const sub = newSubscription();
+    Object.assign(sub, fields);
+    sub.priceHistory = [{ date: new Date().toISOString().slice(0, 10), amount, note: 'Initial' }];
+    App.data.subscriptions.push(sub);
+  }
+
+  markDirty();
+  closeModal('modal-sub');
+  renderApp();
+  toast(App.editingId ? 'Stream updated' : 'Stream added 🌊');
+  App.editingId = null;
+  if (!Auth.isGuest()) pushToWorker();
+}
+
+function deleteSubscription() {
+  if (!App.editingId) return;
+  App.data.subscriptions = App.data.subscriptions.filter(s => s.id !== App.editingId);
+  markDirty();
+  closeModal('modal-sub');
+  renderApp();
+  toast('Stream removed');
+  App.editingId = null;
+  if (!Auth.isGuest()) pushToWorker();
+}
+
+// ─── Modals + toast ───────────────────────────────────────────────
+function openModal(id)  { $('#' + id)?.classList.add('open'); }
+function closeModal(id) { $('#' + id)?.classList.remove('open'); }
+
+function toast(msg) {
+  const c = $('#toast-container'); if (!c) return;
+  const el = document.createElement('div');
+  el.className = 'toast'; el.textContent = msg;
+  c.appendChild(el);
+  setTimeout(() => el.remove(), 3600);
+}
+
+// ─── Settings ─────────────────────────────────────────────────────
+function openSettings() {
+  fillSelect($('#settings-currency'), CURRENCIES, c => c, c => c);
+  $('#settings-currency').value = App.data.settings.currency;
+  $('#settings-flowview').value = App.data.settings.flowView;
+  $('#settings-capacity-amount').value = App.data.settings.capacityAmount || '';
+  $('#settings-capacity-period').value = App.data.settings.capacityPeriod || 'monthly';
+  $('#settings-notify').checked = !!App.data.settings.notifyBrowser;
+  wireAuthSettings();
+  openModal('modal-settings');
+}
+
+function wireAuthSettings() {
+  Auth.renderSettingsSection();
+  const workerEl = $('#settings-worker-url');
+  if (workerEl) workerEl.value = App.data.workerUrl || '';
+  const last = $('#settings-last-synced');
+  if (last) last.textContent = App.data.lastSyncTime ? new Date(App.data.lastSyncTime).toLocaleString() : 'Never';
+}
+
+// Settings already persist on change; the Save button is the explicit,
+// discoverable confirm — it also commits the worker-URL field in case it
+// wasn't blurred, re-renders, syncs, and closes. (Notifications keep their
+// own permission-aware handler and aren't re-toggled here.)
+function saveSettings() {
+  App.data.settings.currency = $('#settings-currency').value;
+  App.data.settings.flowView = $('#settings-flowview').value;
+  const capRaw = parseFloat($('#settings-capacity-amount').value);
+  App.data.settings.capacityAmount = (Number.isFinite(capRaw) && capRaw > 0) ? capRaw : 0;
+  App.data.settings.capacityPeriod = $('#settings-capacity-period').value === 'annual' ? 'annual' : 'monthly';
+  const w = $('#settings-worker-url');
+  if (w) App.data.workerUrl = w.value.trim().replace(/\/+$/, '');
+  markDirty();
+  renderApp();
+  toast('Settings saved');
+  closeModal('modal-settings');
+  if (!Auth.isGuest()) pushToWorker();
+}
+
+// ─── Backup ───────────────────────────────────────────────────────
+function exportBackup() {
+  const blob = new Blob([JSON.stringify(App.data, null, 2)], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `rivulet-backup-${new Date().toISOString().slice(0, 10)}.json`;
+  a.click();
+  URL.revokeObjectURL(url);
+  toast('Backup exported');
+}
+
+async function importBackup(file) {
+  try {
+    const raw = JSON.parse(await file.text());
+    App.data = mergeData(raw);
+    saveLocal(); renderApp();
+    closeModal('modal-settings');
+    toast('Backup imported ✓');
+    if (!Auth.isGuest()) pushToWorker();
+  } catch { toast('⚠️ That file could not be read as a Rivulet backup'); }
+}
+
+// An installment plan doesn't auto-renew — the two are mutually exclusive.
+// When finite is on, force auto-renew off and lock it (a disabled, unchecked
+// box reads as "not applicable"); when finite is off, restore the normal
+// default (on + editable).
+function syncAutoRenewForFinite(isFinite) {
+  const ar = $('#sub-autorenew');
+  if (!ar) return;
+  if (isFinite) { ar.checked = false; ar.disabled = true; }
+  else          { ar.disabled = false; ar.checked = true; }
+}
+
+// Compute and display the "Last payment: Mon DD, YYYY" hint in the modal.
+// Called whenever the frequency, next-charge date, or remaining-payments change.
+function updateFiniteEndLabel() {
+  const el = $('#sub-finite-end-label');
+  if (!el) return;
+  const isFiniteChecked = !!$('#sub-is-finite')?.checked;
+  if (!isFiniteChecked) { el.textContent = ''; return; }
+  const remaining = parseInt($('#sub-remaining')?.value, 10);
+  const nextDate  = $('#sub-next-date')?.value;
+  const freq      = $('#sub-frequency')?.value || 'monthly';
+  if (!(remaining >= 1) || !nextDate) { el.textContent = ''; return; }
+  // Build a temporary stub to reuse finiteEndDate logic.
+  const stub = { isFinite: true, remainingPayments: remaining, nextChargeDate: nextDate, frequency: freq };
+  const end = finiteEndDate(stub);
+  if (!end) { el.textContent = ''; return; }
+  const label = end.toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' });
+  el.textContent = `Last payment: ${label}`;
+}
+
+// ─── Event wiring ─────────────────────────────────────────────────
+function wireEvents() {
+  $('#btn-settings').addEventListener('click', openSettings);
+  $('#btn-theme').addEventListener('click', toggleTheme);
+  $('#btn-reminders').addEventListener('click', openReminders);
+  $('#btn-import').addEventListener('click', openImport);
+  $('#btn-add').addEventListener('click', () => openSubModal());
+  $('#btn-add-empty').addEventListener('click', () => openSubModal());
+
+  $('#import-download').addEventListener('click', downloadTemplate);
+  $('#import-file').addEventListener('change', e => handleImportFile(e.target.files && e.target.files[0]));
+  $('#sub-template').addEventListener('change', e => { if (e.target.value !== '') applyTemplate(+e.target.value); });
+
+  $('#sub-save').addEventListener('click', saveSubscription);
+  $('#sub-delete').addEventListener('click', deleteSubscription);
+
+  // Finite / installment controls
+  $('#sub-is-finite').addEventListener('change', e => {
+    $('#sub-finite-group').style.display = e.target.checked ? '' : 'none';
+    syncAutoRenewForFinite(e.target.checked);
+    updateFiniteEndLabel();
+  });
+  ['#sub-remaining', '#sub-next-date', '#sub-frequency'].forEach(sel => {
+    const el = $(sel);
+    if (el) el.addEventListener('change', updateFiniteEndLabel);
+    if (el) el.addEventListener('input', updateFiniteEndLabel);
+  });
+
+  // modal close buttons + overlay click + Esc
+  $$('[data-close]').forEach(b => b.addEventListener('click', () => closeModal(b.dataset.close)));
+  $$('.modal-overlay').forEach(ov => ov.addEventListener('click', e => { if (e.target === ov) ov.classList.remove('open'); }));
+  document.addEventListener('keydown', e => { if (e.key === 'Escape') $$('.modal-overlay.open').forEach(m => m.classList.remove('open')); });
+
+  // search
+  $('#search').addEventListener('input', e => { App.search = e.target.value; renderStreams(false); });
+
+  // status filters
+  $$('#status-filters .chip').forEach(chip => chip.addEventListener('click', () => {
+    $$('#status-filters .chip').forEach(c => c.classList.remove('is-active'));
+    chip.classList.add('is-active');
+    App.filter = chip.dataset.status;
+    renderStreams();
+  }));
+
+  // flow period toggle
+  $$('.flow-toggle-btn').forEach(b => b.addEventListener('click', () => {
+    App.data.settings.flowView = b.dataset.period;
+    saveLocal(); renderHero();
+  }));
+
+  // hero bars view toggle (Streams / Categories)
+  $$('.view-toggle-btn').forEach(b => b.addEventListener('click', () => {
+    App.heroView = b.dataset.view;
+    if (App.heroView === 'stream') App.categoryFilter = null;   // category scope is a category-view concept
+    renderHero(); renderStreams();
+  }));
+  $('#cat-clear').addEventListener('click', () => { if (App.categoryFilter) selectCategory(App.categoryFilter); });
+
+  // projection horizon toggle
+  $$('.proj-toggle-btn').forEach(b => b.addEventListener('click', () => {
+    App.projMonths = +b.dataset.months;
+    renderProjection();
+  }));
+
+  // settings: preferences
+  $('#settings-currency').addEventListener('change', e => { App.data.settings.currency = e.target.value; markDirty(); renderApp(); });
+  $('#settings-flowview').addEventListener('change', e => { App.data.settings.flowView = e.target.value; saveLocal(); renderHero(); });
+  $('#settings-capacity-amount').addEventListener('input', e => {
+    const v = parseFloat(e.target.value);
+    App.data.settings.capacityAmount = (Number.isFinite(v) && v > 0) ? v : 0;
+    markDirty(); renderHero();
+  });
+  $('#settings-capacity-period').addEventListener('change', e => {
+    App.data.settings.capacityPeriod = e.target.value === 'annual' ? 'annual' : 'monthly';
+    markDirty(); renderHero();
+  });
+  $('#settings-notify').addEventListener('change', async e => {
+    if (e.target.checked) {
+      if (typeof Notification === 'undefined') { toast('This browser does not support notifications'); e.target.checked = false; return; }
+      let perm = Notification.permission;
+      if (perm === 'default') perm = await Notification.requestPermission();
+      if (perm !== 'granted') { toast('Notifications are blocked — enable them in your browser settings'); e.target.checked = false; App.data.settings.notifyBrowser = false; markDirty(); return; }
+      App.data.settings.notifyBrowser = true; markDirty(); toast('Browser reminders on');
+    } else {
+      App.data.settings.notifyBrowser = false; markDirty();
+    }
+  });
+
+  // settings: backup
+  $('#btn-export').addEventListener('click', exportBackup);
+  $('#import-file').addEventListener('change', e => { if (e.target.files[0]) importBackup(e.target.files[0]); });
+
+  // settings: account (auth)
+  $('#settings-create-account').addEventListener('click', () => { closeModal('modal-settings'); Auth.showSetupFresh(); });
+  $('#settings-worker-url').addEventListener('change', e => { App.data.workerUrl = e.target.value.trim().replace(/\/+$/, ''); saveLocal(); });
+  $('#settings-sync-now-btn').addEventListener('click', async () => { const ok = await pushToWorker(); toast(ok ? 'Synced ✓' : 'Could not sync — check your connection'); wireAuthSettings(); });
+  $('#settings-token-change').addEventListener('click', () => { closeModal('modal-settings'); Auth.showSetupLoadToken(); });
+  $('#settings-upgrade-google-btn').addEventListener('click', () => { closeModal('modal-settings'); Auth.showGoogleUpgradeFlow(); });
+  $('#settings-account-btn').addEventListener('click', () => { closeModal('modal-settings'); Auth.isGuest() ? Auth.showGuestSwitchConfirm() : Auth.showAccountSetup(); });
+  $('#settings-token-copy').addEventListener('click', () => navigator.clipboard?.writeText(App.data.userToken || '').then(() => toast('Token copied')));
+  $('#settings-save').addEventListener('click', saveSettings);
+}
+
+// ─── Boot ─────────────────────────────────────────────────────────
+async function boot() {
+  const stored = ls.get(STORAGE_KEY);
+  App.data = stored ? mergeData(stored) : defaultData();
+
+  const googleClientId = await fetchGoogleClientId();
+
+  Auth.init({
+    googleClientId,
+    storageKey: STORAGE_KEY, storageAuthKey: STORAGE_AUTH_KEY, storageDismissKey: STORAGE_DISMISS_KEY,
+    workerBase: getWorkerUrl,
+    getData: () => App.data,
+    setData: d => { App.data = d; saveLocal(); },
+    mergeData, onSignedIn, onGuestReady,
+    onSessionExpired: () => {},
+    pushToWorker, startSyncPing,
+    openModal, closeModal, toast,
+    appName: 'Rivulet', appEmoji: '🌊',
+  });
+
+  wireEvents();
+
+  if (!stored) { renderApp(); Auth.showAccountSetup(); return; }
+
+  const tokenBeforePull = App.data.userToken;
+  if (getWorkerUrl()) {
+    const remote = await pullFromWorker();
+    if (remote) {
+      const subs = mergeById(remote.subscriptions, App.data.subscriptions);
+      const pm   = mergeById(remote.paymentMethods, App.data.paymentMethods);
+      App.data = mergeData(remote);
+      App.data.subscriptions = subs;
+      App.data.paymentMethods = pm;
+      saveLocal();
+    }
+  }
+
+  const ok = await Auth.bootCheck(tokenBeforePull);
+  if (!ok) { renderApp(); return; }
+
+  advanceOverdueDates();   // silently step any overdue auto-renewing charge dates forward
+  renderApp();
+  updateSyncIndicator();
+  if (!Auth.isGuest()) startSyncPing();
+  maybeSync();
+  maybeNotify();
+}
+
+document.addEventListener('DOMContentLoaded', boot);
