@@ -67,8 +67,7 @@ function defaultData() {
     firstName: '', lastName: '', username: '',
     subscriptions:  [],
     paymentMethods: [],
-    settings: { currency: 'USD', flowView: 'monthly', reminderLeads: [7, 1], notifyBrowser: false,
-                capacityAmount: 0, capacityPeriod: 'monthly', theme: 'light' },
+    settings: { currency: 'USD', flowView: 'monthly', reminderLeads: [7, 1], notifyBrowser: false },
     dismissedReminders: {},   // reminderId → date dismissed (re-surfaces next cycle)
     lastNotifyDate: '',       // YYYY-MM-DD of the last browser notification (once/day)
     lastSyncTime: 0, pendingSync: false, lastModified: Date.now(),
@@ -86,10 +85,7 @@ function mergeData(raw) {
       ? raw.dismissedReminders : d.dismissedReminders,
     settings: (raw.settings && typeof raw.settings === 'object')
       ? { ...d.settings, ...raw.settings,
-          reminderLeads: Array.isArray(raw.settings.reminderLeads) ? raw.settings.reminderLeads : d.settings.reminderLeads,
-          capacityAmount: (Number.isFinite(+raw.settings.capacityAmount) && +raw.settings.capacityAmount > 0) ? +raw.settings.capacityAmount : 0,
-          capacityPeriod: raw.settings.capacityPeriod === 'annual' ? 'annual' : 'monthly',
-          theme: raw.settings.theme === 'dark' ? 'dark' : 'light' }
+          reminderLeads: Array.isArray(raw.settings.reminderLeads) ? raw.settings.reminderLeads : d.settings.reminderLeads }
       : d.settings,
   };
 }
@@ -164,29 +160,6 @@ function hasMixedCurrencies() {
 
 function activeMonthlyTotal() {
   return App.data.subscriptions.filter(isActive).reduce((sum, s) => sum + normMonthly(s), 0);
-}
-
-// ─── Capacity ─────────────────────────────────────────────────────
-// An optional personal ceiling (NOT a budget). The amount is held in the
-// display currency; we normalize it to a monthly figure so the ratio is
-// the same whether the hero shows monthly or annual.
-function capacityMonthly() {
-  const amt = +App.data.settings.capacityAmount || 0;
-  if (amt <= 0) return 0;
-  return App.data.settings.capacityPeriod === 'annual' ? amt / 12 : amt;
-}
-// Total active flow as a fraction of capacity (0..∞), or null when unset.
-function capacityRatio() {
-  const cap = capacityMonthly();
-  if (cap <= 0) return null;
-  return activeMonthlyTotal() / cap;
-}
-// Band for a ratio: 'ok' (<75%) | 'near' (75–100%) | 'over' (>100%); null if unset.
-function capacityBand(ratio = capacityRatio()) {
-  if (ratio == null) return null;
-  if (ratio > 1)     return 'over';
-  if (ratio >= 0.75) return 'near';
-  return 'ok';
 }
 
 // Monthly spend on active streams in one category, in the display currency.
@@ -514,8 +487,8 @@ function csvCell(v) {
 
 function csvTemplate() {
   const examples = [
-    ['Netflix', '15.49', 'USD', 'monthly', 'Entertainment', '2026-07-15', 'active', 'Visa **4421', '2026-06-22', '0', 'yes', 'yes', 'no', 'Standard plan'],
-    ['Adobe Creative Cloud', '59.99', 'USD', 'monthly', 'Development', '2026-07-02', 'active', 'Amex **11521', '', '30', 'yes', 'yes', 'yes', '30-day cancellation notice required'],
+    ['Netflix', '15.49', 'USD', 'monthly', 'Entertainment', '2026-07-15', 'active', 'Visa ••4421', '2026-06-22', '0', 'yes', 'yes', 'no', 'Standard plan'],
+    ['Adobe Creative Cloud', '59.99', 'USD', 'monthly', 'Development', '2026-07-02', 'active', 'Amex', '', '30', 'yes', 'yes', 'yes', '30-day cancellation notice required'],
   ];
   return [CSV_COLUMNS, ...examples].map(r => r.map(csvCell).join(',')).join('\r\n') + '\r\n';
 }
@@ -692,30 +665,7 @@ function applyTemplate(i) {
 }
 
 // ─── Rendering ────────────────────────────────────────────────────
-// ─── Theme ────────────────────────────────────────────────────────
-// Light/dark only. The choice lives in settings.theme; applying it just
-// toggles data-theme on <html> and every color (token-driven) follows.
-// An inline <head> script sets it pre-paint to avoid a flash; this keeps
-// the attribute and the toggle's label in sync on each render.
-function applyTheme() {
-  const dark = App.data?.settings?.theme === 'dark';
-  document.documentElement.setAttribute('data-theme', dark ? 'dark' : 'light');
-  const btn = $('#btn-theme');
-  if (btn) {
-    const label = dark ? 'Switch to light mode' : 'Switch to dark mode';
-    btn.title = label;
-    btn.setAttribute('aria-label', label);
-  }
-}
-
-function toggleTheme() {
-  App.data.settings.theme = App.data.settings.theme === 'dark' ? 'light' : 'dark';
-  applyTheme();
-  markDirty();
-}
-
 function renderApp() {
-  applyTheme();
   const subs = App.data.subscriptions;
   const has = subs.length > 0;
 
@@ -787,14 +737,6 @@ function renderHero() {
   const shown = annual ? baseMonthly * 12 : baseMonthly;
   animateNumber($('#flow-amount'), shown, formatMoney);
 
-  // Capacity color cue — only on the global flow figure. When a category is
-  // selected the number is that category's total, so the overall ceiling
-  // doesn't apply.
-  const flowEl = $('#flow-amount');
-  flowEl.classList.remove('cap-ok', 'cap-near', 'cap-over');
-  const band = cat ? null : capacityBand();
-  if (band) flowEl.classList.add('cap-' + band);
-
   // Eyebrow names the current scope so the big number is never ambiguous.
   $('#hero-eyebrow').textContent = cat
     ? `${cat} · ${annual ? 'annual' : 'monthly'} flow`
@@ -825,15 +767,6 @@ function globalSubstats(annual) {
     `<b>${other.split('/')[0]}</b>/${other.split('/')[1]}`,
     `<b>${activeCount}</b> active ${activeCount === 1 ? 'stream' : 'streams'}`,
   ];
-  const ratio = capacityRatio();
-  if (ratio != null) {
-    const pct  = Math.round(ratio * 100);
-    const gapM = activeMonthlyTotal() - capacityMonthly();       // monthly $ over/under
-    const gap  = formatMoney(Math.abs(annual ? gapM * 12 : gapM));
-    const band = capacityBand(ratio);                            // ok | near | over
-    const tail = ratio > 1 ? `${gap} over` : `${gap} left`;
-    bits.push(`<span class="cap-stat cap-stat-${band}"><b>${pct}%</b> of capacity · ${tail}</span>`);
-  }
   if (renewWeek) bits.push(`<b>${renewWeek}</b> renew this week`);
   if (trials)    bits.push(`<b>${trials}</b> ${trials === 1 ? 'trial' : 'trials'}`);
   if (increases) bits.push(`<span class="leak-stat">${increases} price ${increases === 1 ? 'rise' : 'rises'}</span>`);
@@ -953,6 +886,32 @@ function stepDate(d, freq) {
     default:          x.setMonth(x.getMonth() + 1);
   }
   return x;
+}
+
+// ─── Auto-advance overdue charge dates ────────────────────────────
+// On every boot, walk active/trial streams whose nextChargeDate has passed
+// and step it forward by their billing frequency until it reaches today or
+// the future. This means the app self-corrects without any user action.
+// Only streams with autoRenews:true are advanced (manually-managed streams
+// are left alone so the overdue reminder stays visible).
+function advanceOverdueDates() {
+  const today = startOfToday();
+  let changed = false;
+  for (const s of App.data.subscriptions) {
+    if (s.status !== 'active' && s.status !== 'trial') continue;
+    if (!s.nextChargeDate || !s.autoRenews) continue;
+    let d = parseDate(s.nextChargeDate);
+    if (!d || d >= today) continue;   // already current
+    let guard = 0;
+    while (d < today && guard++ < 3000) d = stepDate(d, s.frequency);
+    const next = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+    if (next !== s.nextChargeDate) {
+      s.nextChargeDate = next;
+      s.updatedAt = Date.now();
+      changed = true;
+    }
+  }
+  if (changed) markDirty();
 }
 
 function chargeDatesWithin(sub, start, end) {
@@ -1293,8 +1252,6 @@ function openSettings() {
   fillSelect($('#settings-currency'), CURRENCIES, c => c, c => c);
   $('#settings-currency').value = App.data.settings.currency;
   $('#settings-flowview').value = App.data.settings.flowView;
-  $('#settings-capacity-amount').value = App.data.settings.capacityAmount || '';
-  $('#settings-capacity-period').value = App.data.settings.capacityPeriod || 'monthly';
   $('#settings-notify').checked = !!App.data.settings.notifyBrowser;
   wireAuthSettings();
   openModal('modal-settings');
@@ -1315,9 +1272,6 @@ function wireAuthSettings() {
 function saveSettings() {
   App.data.settings.currency = $('#settings-currency').value;
   App.data.settings.flowView = $('#settings-flowview').value;
-  const capRaw = parseFloat($('#settings-capacity-amount').value);
-  App.data.settings.capacityAmount = (Number.isFinite(capRaw) && capRaw > 0) ? capRaw : 0;
-  App.data.settings.capacityPeriod = $('#settings-capacity-period').value === 'annual' ? 'annual' : 'monthly';
   const w = $('#settings-worker-url');
   if (w) App.data.workerUrl = w.value.trim().replace(/\/+$/, '');
   markDirty();
@@ -1353,7 +1307,6 @@ async function importBackup(file) {
 // ─── Event wiring ─────────────────────────────────────────────────
 function wireEvents() {
   $('#btn-settings').addEventListener('click', openSettings);
-  $('#btn-theme').addEventListener('click', toggleTheme);
   $('#btn-reminders').addEventListener('click', openReminders);
   $('#btn-import').addEventListener('click', openImport);
   $('#btn-add').addEventListener('click', () => openSubModal());
@@ -1405,15 +1358,6 @@ function wireEvents() {
   // settings: preferences
   $('#settings-currency').addEventListener('change', e => { App.data.settings.currency = e.target.value; markDirty(); renderApp(); });
   $('#settings-flowview').addEventListener('change', e => { App.data.settings.flowView = e.target.value; saveLocal(); renderHero(); });
-  $('#settings-capacity-amount').addEventListener('input', e => {
-    const v = parseFloat(e.target.value);
-    App.data.settings.capacityAmount = (Number.isFinite(v) && v > 0) ? v : 0;
-    markDirty(); renderHero();
-  });
-  $('#settings-capacity-period').addEventListener('change', e => {
-    App.data.settings.capacityPeriod = e.target.value === 'annual' ? 'annual' : 'monthly';
-    markDirty(); renderHero();
-  });
   $('#settings-notify').addEventListener('change', async e => {
     if (e.target.checked) {
       if (typeof Notification === 'undefined') { toast('This browser does not support notifications'); e.target.checked = false; return; }
@@ -1481,6 +1425,7 @@ async function boot() {
   const ok = await Auth.bootCheck(tokenBeforePull);
   if (!ok) { renderApp(); return; }
 
+  advanceOverdueDates();   // silently step any overdue auto-renewing charge dates forward
   renderApp();
   updateSyncIndicator();
   if (!Auth.isGuest()) startSyncPing();
