@@ -3,7 +3,7 @@
 A personal subscription tracker built around the idea that recurring spending is a set of streams draining away each month — not a budget to police, but a map of commitments to see clearly. Track subscriptions, utilities, and finite payment plans; watch your flow rendered as living bars that widen with cost; set an optional capacity ceiling; and project the exact amount leaving your account over the next twelve months. No build tools, no npm, no dependencies — just static files and a Cloudflare Worker backend for authentication and cross-device sync.
 
 #### Demo:
-https://your-username.github.io/rivulet
+https://badbox29.github.io/rivulet
 
 ---
 
