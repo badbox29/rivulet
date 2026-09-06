@@ -168,10 +168,30 @@ code { font-family: var(--font-mono); }
 }
 .search-input:focus { outline: none; border-color: var(--current); box-shadow: 0 0 0 3px var(--focus-ring); }
 .topbar-actions { display: flex; align-items: center; gap: .6rem; margin-left: auto; }
+.sync-chip { display: inline-flex; align-items: center; }
 .sync-dot {
   width: 9px; height: 9px; border-radius: 50%;
   background: var(--ember); box-shadow: 0 0 0 3px var(--ember-pale);
 }
+/* Transient failure — same shape as "unsynced", different colour. Will retry. */
+.sync-dot-error { background: var(--red, #c07070); box-shadow: 0 0 0 3px rgba(192,112,112,.18); }
+/* Terminal auth failure. Deliberately NOT a dot: a dead credential is not a
+   blip, it is a stopped sync, and it needs to read as text the user can act on. */
+.sync-chip-auth {
+  width: auto; height: auto; border-radius: 999px;
+  padding: .22rem .6rem; gap: .4rem;
+  font-size: .72rem; font-weight: 600; letter-spacing: .01em; white-space: nowrap;
+  color: #fff; background: var(--red, #c07070);
+  border: 1px solid rgba(0,0,0,.08); box-shadow: none;
+  cursor: pointer;
+}
+.sync-chip-auth::before {
+  content: ''; width: 6px; height: 6px; border-radius: 50%;
+  background: currentColor; flex: none;
+}
+.sync-chip-auth:hover  { filter: brightness(1.06); }
+.sync-chip-auth:focus-visible { outline: 2px solid var(--red, #c07070); outline-offset: 2px; }
+@media (max-width: 520px) { .sync-chip-auth { font-size: 0; padding: .32rem; } }
 .icon-btn {
   display: grid; place-items: center;
   width: 36px; height: 36px; padding: 0;
