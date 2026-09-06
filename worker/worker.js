@@ -257,8 +257,29 @@ async function storagePut(env, key, request) {
     return json({ ok: true });
   }
 
-  await env.RIVULET_KV.put(`profile:${key}`, JSON.stringify(data));
-  return json({ ok: true });
+  // A device that hasn't pulled since a legacy→secure token upgrade still signs
+  // with the old token. storageGet forwards it; PUT must forward too, or the
+  // write lands on a key nothing ever reads again and is silently orphaned.
+  let target = key;
+  if (!key.startsWith('google:')) {
+    const fwd = await env.RIVULET_KV.get(`forward:${key}`);
+    if (fwd) target = fwd;
+  }
+
+  // Timestamp guard — refuse a write that is older than what we already hold.
+  // Writes with no usable `lastModified` pass through untouched so imports,
+  // migrations and older clients aren't blocked.
+  const submittedAt = Number(data.lastModified);
+  if (Number.isFinite(submittedAt) && submittedAt > 0) {
+    const existing = await env.RIVULET_KV.get(`profile:${target}`, 'json');
+    const storedAt = Number(existing && existing.lastModified);
+    if (Number.isFinite(storedAt) && storedAt > submittedAt) {
+      return json({ ok: false, error: 'stale write', storedAt, submittedAt }, 409);
+    }
+  }
+
+  await env.RIVULET_KV.put(`profile:${target}`, JSON.stringify(data));
+  return json({ ok: true, storedAt: submittedAt || Date.now() });
 }
 
 // ─── Auth handlers ────────────────────────────────────────────────
