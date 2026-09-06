@@ -131,12 +131,56 @@ function markDirty() {
   App.data.pendingSync = true;
   App.data.lastModified = Date.now();
   saveLocal();
+  if (App.syncStatus !== 'authfail') App.syncStatus = 'pending';
   updateSyncIndicator();
 }
 
+// Sync status is deliberately three-way. An expired credential is not a
+// dropped connection: retrying it forever learns nothing, so it gets its own
+// terminal state and its own visibly different chip.
+//   'idle' | 'pending' | 'error' (transient, will retry) | 'authfail' (terminal)
+function setSyncStatus(status) {
+  App.syncStatus = status;
+  updateSyncIndicator();
+}
+
+function isAuthFailed() { return App.syncStatus === 'authfail'; }
+
 function updateSyncIndicator() {
   const el = $('#sync-indicator');
-  if (el) el.style.display = (App.data?.pendingSync && getWorkerUrl()) ? '' : 'none';
+  if (!el) return;
+
+  if (!getWorkerUrl() || Auth.isGuest()) { el.style.display = 'none'; return; }
+
+  if (App.syncStatus === 'authfail') {
+    el.style.display = '';
+    el.className     = 'sync-chip sync-chip-auth';
+    el.textContent   = 'Signed out · not syncing';
+    el.title         = 'Your session expired. Your changes are saved on this device only. Click to sign in again.';
+    el.setAttribute('role', 'button');
+    el.tabIndex      = 0;
+    return;
+  }
+
+  el.removeAttribute('role');
+  el.removeAttribute('tabindex');
+  el.textContent = '';
+
+  if (App.syncStatus === 'error') {
+    el.style.display = '';
+    el.className     = 'sync-chip sync-dot sync-dot-error';
+    el.title         = 'Could not reach the server — will retry';
+    return;
+  }
+
+  if (App.data?.pendingSync) {
+    el.style.display = '';
+    el.className     = 'sync-chip sync-dot';
+    el.title         = 'Unsynced changes';
+    return;
+  }
+
+  el.style.display = 'none';
 }
 
 // ─── Domain calculations ──────────────────────────────────────────
@@ -398,24 +442,92 @@ function maybeNotify() {
 // ─── Worker sync ──────────────────────────────────────────────────
 function getWorkerUrl() { return App.data?.workerUrl || ''; }
 
-async function pushToWorker() {
+// Merge a remote blob into a local one without discarding either side.
+// Records union by id (newest updatedAt wins); scalars and settings stay local
+// when this device has unsynced edits or a newer clock.
+function reconcileData(remote, local) {
+  const out = mergeData(remote);
+  out.subscriptions  = mergeById(remote.subscriptions,  local.subscriptions);
+  out.paymentMethods = mergeById(remote.paymentMethods, local.paymentMethods);
+
+  const localTs  = Number(local.lastModified)  || 0;
+  const remoteTs = Number(remote.lastModified) || 0;
+  const dirty    = !!local.pendingSync;
+
+  if (dirty || localTs > remoteTs) {
+    out.settings = { ...out.settings, ...(local.settings || {}) };
+  }
+  out.workerUrl    = local.workerUrl || out.workerUrl;
+  out.userToken    = local.userToken || out.userToken;
+  out.pendingSync  = dirty;
+  out.lastModified = Math.max(localTs, remoteTs);
+  return out;
+}
+
+function applyRemote(remote) {
+  App.data = reconcileData(remote, App.data);
+  saveLocal();
+}
+
+async function pushToWorker(opts = {}) {
   const base = getWorkerUrl().replace(/\/+$/, '');
   if (!base) return false;
   const token = App.data?.userToken;
   if (!token) return false;
+
+  if (!App.data.lastModified) App.data.lastModified = Date.now();
   const body = JSON.stringify(App.data);
+
+  // null means credentials could not be produced at all — an unsigned request
+  // would just 401. Surface it instead of sending it.
   const headers = await Auth._authHeaders('PUT', token, body);
+  if (!headers) { setSyncStatus('authfail'); return false; }
+
+  let res;
   try {
-    const res = await fetch(`${base}/storage/${encodeURIComponent(token)}/profile`, {
+    res = await fetch(`${base}/storage/${encodeURIComponent(token)}/profile`, {
       method: 'PUT', headers: { 'Content-Type': 'application/json', ...headers }, body,
     });
-    if (res.ok) {
-      App.data.pendingSync = false;
-      App.data.lastSyncTime = Date.now();
-      saveLocal(); updateSyncIndicator();
-    } else { console.error(`[Rivulet] pushToWorker failed (${res.status})`); }
-    return res.ok;
-  } catch (e) { console.error('[Rivulet] pushToWorker network error:', e); return false; }
+  } catch (e) {
+    // Genuine network throw — transient, keep retrying.
+    console.error('[Rivulet] pushToWorker network error:', e);
+    setSyncStatus('error');
+    return false;
+  }
+
+  if (res.ok) {
+    App.data.pendingSync  = false;
+    App.data.lastSyncTime = Date.now();
+    saveLocal();
+    setSyncStatus('idle');
+    return true;
+  }
+
+  // Terminal: the credential is dead. Stop retrying, try once to repair it.
+  if (res.status === 401 || res.status === 403) {
+    console.error(`[Rivulet] pushToWorker rejected credential (${res.status})`);
+    setSyncStatus('authfail');
+    if (!opts._afterReauth && Auth.isGoogleAccount()) {
+      const ok = await Auth.refreshGoogleToken();
+      if (ok) return pushToWorker({ ...opts, _afterReauth: true });
+    }
+    return false;
+  }
+
+  // Server holds newer data than we submitted. Pull, merge, retry once.
+  if (res.status === 409 && !opts._afterConflict) {
+    console.warn('[Rivulet] pushToWorker conflict — pulling and merging');
+    const remote = await pullFromWorker();
+    if (remote) applyRemote(remote);
+    App.data.pendingSync  = true;
+    App.data.lastModified = Date.now();
+    saveLocal();
+    return pushToWorker({ ...opts, _afterConflict: true });
+  }
+
+  console.error(`[Rivulet] pushToWorker failed (${res.status})`);
+  setSyncStatus('error');
+  return false;
 }
 
 async function pullFromWorker() {
@@ -423,23 +535,39 @@ async function pullFromWorker() {
   if (!base) return null;
   const token = App.data?.userToken;
   if (!token) return null;
+
   const headers = await Auth._authHeaders('GET', token, '');
+  if (!headers) { setSyncStatus('authfail'); return null; }
+
   try {
     const res = await fetch(`${base}/storage/${encodeURIComponent(token)}/profile`, { headers });
     if (res.status === 410) { App.data.authMethod = 'google'; saveLocal(); return null; }
+
+    // A rejected credential must not look like an empty account, or boot
+    // proceeds as though there is nothing remote and the next push clobbers it.
+    if (res.status === 401 || res.status === 403) {
+      console.error(`[Rivulet] pullFromWorker rejected credential (${res.status})`);
+      setSyncStatus('authfail');
+      return null;
+    }
+
     const migratedTo = res.headers.get('X-Token-Migrated');
     if (migratedTo) {
       const j = await res.json(); const remote = j.value ?? j;
-      App.data = Auth.handlePullMigration(migratedTo, mergeData(remote));
+      App.data = Auth.handlePullMigration(migratedTo, reconcileData(remote, App.data));
       saveLocal(); return remote;
     }
     if (!res.ok) return null;
     const j = await res.json(); return j.value ?? j;
-  } catch { return null; }
+  } catch (e) {
+    console.error('[Rivulet] pullFromWorker network error:', e);
+    return null;
+  }
 }
 
 function shouldSync() {
   if (Auth.isGuest() || !getWorkerUrl() || !App.data.pendingSync) return false;
+  if (isAuthFailed()) return false;   // dead credential — retrying learns nothing
   return (Date.now() - (App.data.lastSyncTime || 0)) >= SYNC_THRESHOLD_MS;
 }
 async function maybeSync() { if (shouldSync()) await pushToWorker(); }
@@ -449,6 +577,7 @@ function startSyncPing() {
 }
 function bestEffortPushOnHide() {
   if (Auth.isGuest() || !getWorkerUrl() || !App.data.pendingSync) return;
+  if (isAuthFailed()) return;
   pushToWorker();
 }
 document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') bestEffortPushOnHide(); });
@@ -1765,6 +1894,20 @@ function wireEvents() {
     }
   });
 
+  // sync chip: when the credential is dead, clicking it starts repair
+  const syncEl = $('#sync-indicator');
+  if (syncEl) {
+    const repair = () => {
+      if (!isAuthFailed()) return;
+      if (Auth.isGoogleAccount()) Auth.showGoogleReauth();
+      else toast('Sync is unavailable — this browser cannot sign requests securely.');
+    };
+    syncEl.addEventListener('click', repair);
+    syncEl.addEventListener('keydown', e => {
+      if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); repair(); }
+    });
+  }
+
   // settings: backup
   $('#btn-export').addEventListener('click', exportBackup);
   $('#import-file').addEventListener('change', e => { if (e.target.files[0]) importBackup(e.target.files[0]); });
@@ -1796,6 +1939,18 @@ async function boot() {
     mergeData, onSignedIn, onGuestReady,
     onSessionExpired: () => {},
     pushToWorker, startSyncPing,
+
+    // Credentials are unusable — stop retrying and say so distinctly.
+    onAuthFailure: () => setSyncStatus('authfail'),
+    // Credentials repaired — resume and flush whatever is pending.
+    onAuthRestored: () => {
+      setSyncStatus(App.data?.pendingSync ? 'pending' : 'idle');
+      if (!Auth.isGuest() && App.data?.pendingSync) pushToWorker();
+    },
+    isDirty:        () => !!App.data?.pendingSync,
+    localTimestamp: () => Number(App.data?.lastModified) || 0,
+    reconcile:      (remote, local) => reconcileData(remote, local),
+
     openModal, closeModal, toast,
     appName: 'Rivulet', appEmoji: '🌊',
   });
@@ -1807,14 +1962,7 @@ async function boot() {
   const tokenBeforePull = App.data.userToken;
   if (getWorkerUrl()) {
     const remote = await pullFromWorker();
-    if (remote) {
-      const subs = mergeById(remote.subscriptions, App.data.subscriptions);
-      const pm   = mergeById(remote.paymentMethods, App.data.paymentMethods);
-      App.data = mergeData(remote);
-      App.data.subscriptions = subs;
-      App.data.paymentMethods = pm;
-      saveLocal();
-    }
+    if (remote) applyRemote(remote);
   }
 
   const ok = await Auth.bootCheck(tokenBeforePull);

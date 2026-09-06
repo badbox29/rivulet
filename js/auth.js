@@ -98,6 +98,19 @@
  * Optional config keys:
  *   appName           string   — app name shown in wizard (default: 'the app')
  *   appEmoji          string   — emoji shown in welcome toast (default: '🎉')
+ *   onAuthFailure     function — (reason) credentials are unusable; sync is
+ *                                stopped until repaired. reason is one of
+ *                                'no-credential' | 'signing-unavailable' | 'expired'.
+ *                                Show a distinct, non-dismissible status — NOT
+ *                                the generic network-error styling.
+ *   onAuthRestored    function — credentials are usable again; resume sync.
+ *   isDirty           function — returns true if local data has unsynced edits.
+ *                                Defaults to data.pendingSync.
+ *   localTimestamp    function — returns the local data's last-modified ms.
+ *                                Defaults to data.lastModified.
+ *   reconcile         function — (remote, local) returns a merged object when
+ *                                signing into an existing account. Without it,
+ *                                remote replaces local wholesale.
  * ============================================================
  */
 
@@ -161,12 +174,36 @@ const Auth = (() => {
   // for a worker request based on current account type.
   //   Google → Authorization: Bearer <idToken>
   //   Token  → X-Timestamp + X-Signature (HMAC)
+  //
+  // Returns null — never {} — when credentials cannot be produced. Sending an
+  // unsigned request only earns a 401 that looks like a network blip; the host
+  // app needs to be able to tell the difference and say so in the UI.
   async function _authHeaders(method, token, body) {
     if(isGoogleAccount()) {
       const idToken = store.get(C.storageAuthKey);
-      return idToken ? { 'Authorization': `Bearer ${idToken}` } : {};
+      if(!idToken) { _notifyAuthFailure('no-credential'); return null; }
+      return { 'Authorization': `Bearer ${idToken}` };
     }
-    try { return await _signRequest(method, token, body); } catch { return {}; }
+    try {
+      return await _signRequest(method, token, body);
+    } catch(err) {
+      // crypto.subtle unavailable (insecure context, old WebView) or the token
+      // is unusable. The worker requires HMAC unconditionally, so an unsigned
+      // request is a guaranteed silent failure.
+      console.error('[Auth] request signing failed:', err);
+      _notifyAuthFailure('signing-unavailable');
+      return null;
+    }
+  }
+
+  // _notifyAuthFailure(reason) — tells the host app that sync cannot proceed
+  // until credentials are repaired. Distinct from a transient network error.
+  function _notifyAuthFailure(reason) {
+    try { if(typeof C?.onAuthFailure === 'function') C.onAuthFailure(reason); } catch {}
+  }
+
+  function _notifyAuthRestored() {
+    try { if(typeof C?.onAuthRestored === 'function') C.onAuthRestored(); } catch {}
   }
 
   // ── Token generation ─────────────────────────────────────────────
@@ -238,6 +275,112 @@ const Auth = (() => {
     } catch { return false; }
   }
 
+  // ── Google ID token lifetime management ──────────────────────────
+  // Google ID tokens are valid for roughly one hour. Nothing else in this
+  // module re-checks them once boot is past, so without a scheduled refresh
+  // every write after the first hour signs with a dead credential.
+  //
+  // Strategy: read `exp` at sign-in, wake up REFRESH_LEAD_MS before it, try a
+  // silent GIS re-issue (One Tap with auto_select, hard timeout so a suppressed
+  // prompt can't hang), and if that fails, prompt the user while the old token
+  // is still valid so in-flight writes still land.
+
+  const REFRESH_LEAD_MS  = 5 * 60 * 1000;
+  const SILENT_TIMEOUT_MS = 8000;
+
+  let _refreshTimer = null;
+  let _refreshing   = false;
+  let _reauthOpen   = false;
+
+  // Decodes a JWT payload without verifying the signature. Only used to read
+  // `exp`/profile claims locally — the worker does the real verification.
+  function _decodeJwt(token) {
+    try {
+      const parts = String(token || '').split('.');
+      if(parts.length !== 3) return null;
+      return JSON.parse(atob(parts[1].replace(/-/g,'+').replace(/_/g,'/')));
+    } catch { return null; }
+  }
+
+  function _tokenExpiryMs(token) {
+    const p = _decodeJwt(token);
+    return p && p.exp ? p.exp * 1000 : 0;
+  }
+
+  // scheduleTokenRefresh(idToken) — arms a one-shot timer ahead of expiry.
+  // Safe to call repeatedly; always replaces any pending timer.
+  function scheduleTokenRefresh(idToken) {
+    if(_refreshTimer) { clearTimeout(_refreshTimer); _refreshTimer = null; }
+    if(!isGoogleAccount()) return;
+    const tok   = idToken || store.get(C.storageAuthKey);
+    const expMs = _tokenExpiryMs(tok);
+    if(!expMs) return;
+    const delay = Math.max(0, expMs - Date.now() - REFRESH_LEAD_MS);
+    _refreshTimer = setTimeout(() => { refreshGoogleToken(); }, delay);
+  }
+
+  // _silentGoogleCredential() — attempts a no-interaction credential re-issue.
+  // Resolves with a fresh JWT string, or null if GIS declines or stalls.
+  async function _silentGoogleCredential() {
+    if(!isGoogleAuthAvailable()) return null;
+    await waitForGIS();
+    if(!window.google?.accounts?.id) return null;
+
+    return new Promise(resolve => {
+      let done = false;
+      const finish = (val) => {
+        if(done) return;
+        done = true;
+        try { google.accounts.id.cancel(); } catch {}
+        resolve(val);
+      };
+      // Hard timeout: a suppressed One Tap can otherwise never call back.
+      const timer = setTimeout(() => finish(null), SILENT_TIMEOUT_MS);
+      try {
+        google.accounts.id.initialize({
+          client_id:   C.googleClientId,
+          auto_select: true,
+          callback:    (resp) => { clearTimeout(timer); finish(resp?.credential || null); },
+        });
+        google.accounts.id.prompt(n => {
+          const dead = (n.isSkippedMoment?.() || n.isDismissedMoment?.() || n.isNotDisplayedMoment?.());
+          if(dead) { clearTimeout(timer); finish(null); }
+        });
+      } catch { clearTimeout(timer); finish(null); }
+    });
+  }
+
+  // refreshGoogleToken(opts) — try silent re-issue; on failure optionally show
+  // the re-auth screen. Returns true when a usable credential is now stored.
+  // Call this from the host app when a request comes back 401/403.
+  // HOST APP INTERFACE: calls getData(), setData()
+  async function refreshGoogleToken(opts = {}) {
+    const { promptOnFail = true } = opts;
+    if(!isGoogleAccount()) return false;
+    if(_refreshing) return false;
+    _refreshing = true;
+    try {
+      const fresh = await _silentGoogleCredential();
+      if(fresh) {
+        store.set(C.storageAuthKey, fresh);
+        const p = _decodeJwt(fresh);
+        if(p?.sub) {
+          const d = getData();
+          d.linkedGoogle = { sub: p.sub, email: p.email || '', name: p.name || '', picture: p.picture || '' };
+          C.setData(d);
+        }
+        scheduleTokenRefresh(fresh);
+        _notifyAuthRestored();
+        return true;
+      }
+      _notifyAuthFailure('expired');
+      if(promptOnFail) showGoogleReauth();
+      return false;
+    } finally {
+      _refreshing = false;
+    }
+  }
+
   // ── handleGoogleCredential() ─────────────────────────────────────
   // Core handler called after GIS returns a credential JWT.
   // Flow:
@@ -287,8 +430,42 @@ const Auth = (() => {
     const isNewAccount = !remote;
 
     if(remote) {
-      // Existing Google account — merge with defaults and apply
-      const merged = C.mergeData(remote);
+      const localData = getData() || {};
+
+      // Is this a re-authentication of the SAME account on a device that
+      // already holds data? If so, remote is not authoritative — this device
+      // may hold edits the server has never seen. Applying remote here would
+      // overwrite them locally, and the push that follows would then destroy
+      // them on the server too.
+      const sameAccount = localData.authMethod === 'google' && localData.userToken === kvKey;
+      const dirty       = (typeof C.isDirty === 'function')
+        ? !!C.isDirty()
+        : !!localData.pendingSync;
+      const localTs     = Number((typeof C.localTimestamp === 'function')
+        ? C.localTimestamp()
+        : localData.lastModified) || 0;
+      const remoteTs    = Number(remote.lastModified) || 0;
+
+      if(sameAccount && (dirty || localTs > remoteTs)) {
+        // Keep local. Adopt only the Google identity fields, then push up.
+        const d = localData;
+        d.authMethod   = 'google';
+        d.linkedGoogle = profile;
+        d.userToken    = kvKey;
+        d.workerUrl    = oldWorkerUrl || d.workerUrl;
+        C.setData(d);
+        store.set(C.storageAuthKey, idToken);
+        scheduleTokenRefresh(idToken);
+        C.onSignedIn(d, false);
+        return { ok: true, isNewAccount: false, profile, keptLocal: true };
+      }
+
+      // Otherwise remote leads, but let the host app reconcile record-by-record
+      // rather than discarding whatever is local. Falls back to the old
+      // remote-only behaviour if the host provides no reconcile hook.
+      const merged = (typeof C.reconcile === 'function')
+        ? C.reconcile(remote, localData)
+        : C.mergeData(remote);
       merged.userToken    = kvKey; // always set — remote profile has no userToken field
       merged.workerUrl    = oldWorkerUrl || merged.workerUrl;
       merged.authMethod   = 'google';
@@ -305,8 +482,11 @@ const Auth = (() => {
       C.onSignedIn(d, true);
     }
 
-    // Store ID token for session verification at next boot
+    // Store ID token for session verification at next boot, and arm the
+    // refresh timer so the ~1h expiry doesn't silently kill sync mid-session.
     store.set(C.storageAuthKey, idToken);
+    scheduleTokenRefresh(idToken);
+    _notifyAuthRestored();
 
     return { ok: true, isNewAccount, profile };
   }
@@ -376,6 +556,7 @@ const Auth = (() => {
       google.accounts.id.cancel();
       if(email) google.accounts.id.revoke(email, () => {});
     }
+    if(_refreshTimer) { clearTimeout(_refreshTimer); _refreshTimer = null; }
     store.remove(C.storageAuthKey);
     d.linkedGoogle = null;
     // Keep authMethod as 'google' — don't silently downgrade.
@@ -460,10 +641,17 @@ const Auth = (() => {
     if(isGoogleAccount()) {
       const valid = await verifyGoogleSession();
       if(!valid) {
-        // Show targeted re-auth screen — skips full wizard, no worker URL needed
-        setTimeout(() => showGoogleReauth(), 800);
-        return false;
+        // Try a silent re-issue first — a returning user with a live Google
+        // session shouldn't have to click anything.
+        const refreshed = await refreshGoogleToken({ promptOnFail: false });
+        if(!refreshed) {
+          // Show targeted re-auth screen — skips full wizard, no worker URL needed
+          setTimeout(() => showGoogleReauth(), 800);
+          return false;
+        }
       }
+      // Session is usable — arm the refresh timer for this session.
+      scheduleTokenRefresh();
     }
 
     // 2. Legacy token upgrade prompt
@@ -482,6 +670,10 @@ const Auth = (() => {
   // On success, resumes the app normally without disrupting data.
   // HOST APP INTERFACE: calls getData(), startSyncPing(), closeModal()
   function showGoogleReauth() {
+    // The refresh timer, a 401 from a push and a 401 from a pull can all land
+    // at once; only one re-auth screen should ever be on screen.
+    if(_reauthOpen) return;
+    _reauthOpen = true;
     const d       = getData();
     const name    = d.linkedGoogle?.name    || [d.firstName, d.lastName].filter(Boolean).join(' ') || '';
     const email   = d.linkedGoogle?.email   || '';
@@ -513,6 +705,7 @@ const Auth = (() => {
     `);
 
     document.getElementById('auth-btn-reauth-different').addEventListener('click', () => {
+      _reauthOpen = false;
       C.closeModal('modal-account-setup');
       showAccountSetup();
     });
@@ -522,6 +715,7 @@ const Auth = (() => {
 
     signInWithGoogle(container).then(result => {
       if(result?.ok) {
+        _reauthOpen = false;
         C.closeModal('modal-account-setup');
         C.startSyncPing();
       } else {
@@ -1485,6 +1679,8 @@ const Auth = (() => {
     signInWithGoogle,       // render GIS button and sign in
     signOutGoogle,          // revoke session locally
     verifyGoogleSession,    // call at boot for Google accounts
+    refreshGoogleToken,     // silent re-issue; call on 401/403 from the worker
+    scheduleTokenRefresh,   // arm the pre-expiry refresh timer
 
     // Boot helpers
     bootCheck,              // call after worker pull in DOMContentLoaded
